@@ -1,0 +1,10 @@
+config.json
+__pycache__/
+*.pyc
+*.pyo
+*.bak-*
+*.log
+.DS_Store
+Thumbs.db
+.venv/
+venv/

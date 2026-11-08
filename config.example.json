@@ -1,0 +1,10 @@
+{
+  "workspace_root": "~/workspaces",
+  "config_dir": "configs",
+  "skills_vault": "~/.workbuddy/skills-vault",
+  "skills_user": "~/.workbuddy/skills",
+  "skills_real": "~/.agent_skills/skills",
+  "snippet": "~/.workbuddy/agent-memory-snippet.md",
+  "skills_workspaces": "<config_dir>/skills-workspaces.json",
+  "agent_skill_paths": "<config_dir>/agent-skill-paths.json"
+}

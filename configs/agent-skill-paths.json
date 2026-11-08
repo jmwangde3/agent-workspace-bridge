@@ -1,0 +1,57 @@
+{
+  "note": "各客户端的技能分层路径与优先级对照。WorkBuddy 的分配表驱动 .codebuddy/.workbuddy；本表供 cross_agent_skills.py 把同一份工作空间专属技能投影到各家项目级目录（默认 dry-run，--apply 才写）。各客户端的用户级技能池保持原样。",
+  "agents": [
+    {
+      "name": "claude",
+      "product": "Claude Code",
+      "global_dir": "~/.claude/skills/<name>/SKILL.md",
+      "project_dirs": [".claude/skills"],
+      "precedence": "global > project（Enterprise > Personal > Project）",
+      "nested_discovery": true,
+      "workspace_isolation": true,
+      "evidence": "code.claude.com/docs/en/skills"
+    },
+    {
+      "name": "codex",
+      "product": "OpenAI Codex CLI",
+      "global_dir": "~/.agents/skills/ 与 ~/.codex/skills/(installer, CODEX_HOME)",
+      "project_dirs": [".agents/skills", ".codex/skills"],
+      "precedence": "按 scope 发现；AGENTS.md 三层 ~/.codex/AGENTS.md → 项目根 → 子目录",
+      "nested_discovery": true,
+      "workspace_isolation": true,
+      "evidence": "OpenAI Codex docs / agents/skills 约定"
+    },
+    {
+      "name": "qoder",
+      "product": "Qoder IDE / CLI",
+      "global_dir": "~/.qoder/skills/<name>/SKILL.md",
+      "project_dirs": [".qoder/skills"],
+      "precedence": "user-level overrides project-level",
+      "nested_discovery": false,
+      "workspace_isolation": true,
+      "evidence": "docs.qoder.com/cli/Skills；docs.qoder.com/user-guide/rules"
+    },
+    {
+      "name": "trae",
+      "product": "Trae IDE / Trae SOLO",
+      "global_dir": "~/.trae-cn/skills（技能）+ ~/.trae-cn/user_rules（全局规则）",
+      "project_dirs": [".trae/skills"],
+      "project_rules": ".trae/rules/（alwaysApply / globs / description / @Rule 四种生效方式）",
+      "precedence": "规则明确分全局与项目；技能的项目级路径官方文档未明确",
+      "nested_discovery": false,
+      "workspace_isolation": "partial",
+      "evidence": "docs.trae.cn/work_rules, docs.trae.cn/ide_rules"
+    },
+    {
+      "name": "dsh",
+      "product": "DeepSeek Harness / dsh-purge",
+      "global_dir": "$DSH_HOME/skills/（/skills import 导入，DSH 原生加载）",
+      "project_dirs": [],
+      "project_rules": "当前目录勾选的 AGENTS.md / CLAUDE.md，/rules use 切换多套规则集",
+      "precedence": "每轮注入顺序：prompt-inject.md → 勾选的 workspace AGENTS.md → 插件内置默认；workspace 基线 strict/fallback/always",
+      "nested_discovery": false,
+      "workspace_isolation": false,
+      "evidence": "dsh-purge 文档"
+    }
+  ]
+}
