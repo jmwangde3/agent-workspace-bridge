@@ -31,6 +31,7 @@ import argparse
 import subprocess
 
 from awb_config import CFG, VAULT, USER, REAL, POSIX_REAL, WORKSPACE_ROOT
+import awb_matrix as M
 REPARSE_POINT = 0x400
 
 # 上一轮铺的、与工作空间语义无关的其他 agent 项目目录
@@ -96,14 +97,8 @@ def link_into(names, dst):
 
 
 def bundles_for(name, cfg):
-    """第一条命中的规则生效；返回 (技能名列表, 命中的规则)。"""
-    for r in cfg.get("rules", []):
-        if re.search(r["match"], name):
-            out = []
-            for b in r.get("bundles", []):
-                out.extend(cfg["bundles"].get(b, []))
-            return out, r["match"]
-    return [], None
+    """委托矩阵层：界面勾选的矩阵存在时为准，否则回退到 rules/bundles。"""
+    return M.bundles_for(name, cfg)
 
 
 def report_fail(failed, dst):
@@ -133,8 +128,10 @@ def status(cfg):
 
 
 def apply(cfg, only=None):
+    m, source = M.load_matrix()
     pool = vault_names()
-    glob = [n for n in cfg["global"] if n in pool]
+    print("allocation source:", source, "->", M.MATRIX)
+    glob = M.global_skills(m)
     made, failed = link_into(glob, USER)
     print("global -> %s : %d links %s" % (USER, len(made), glob))
     report_fail(failed, USER)

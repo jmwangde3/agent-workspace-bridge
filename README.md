@@ -16,7 +16,7 @@ AWB 的答案：**不引入服务、不装依赖、不实时协同**。所有客
 
 - 把技能实体收拢到一个 **canonical 目录**，各客户端的项目级 skills 目录做成链接指过去 → 一处增删，落盘后所有客户端立即可见；
 - 把跨客户端规则写进一份 **snippet**，分发到各客户端的规则文件；
-- 用一张**分配表**按工作空间名决定该空间能用哪些技能。
+- 用一张**分配表**（或图形界面里的勾选矩阵）按工作空间决定该空间能用哪些技能。
 
 ## 架构
 
@@ -35,7 +35,8 @@ AWB 的答案：**不引入服务、不装依赖、不实时协同**。所有客
         ├── .trae/skills                            (Trae)
         └── .workbuddy/memory                       (WorkBuddy 会话记忆 → .shared/memory)
 
-skills-workspaces.json  ── 单一事实源：global + bundles + rules（按工作空间名正则）
+skills-matrix.json      ── 图形界面的勾选结果（存在时优先）
+skills-workspaces.json  ── 规则表：global + bundles + rules（无矩阵时回退）
         │  scope_skills.py --apply
         ▼
    canonical 内容重写 → 所有 agent 同时可见
@@ -51,7 +52,7 @@ skills-workspaces.json  ── 单一事实源：global + bundles + rules（按�
 
 ## 前置条件
 
-- Python 3.8+（只用标准库）
+- Python 3.8+（只用标准库；图形界面用自带的 tkinter，不需要额外装包）
 - Windows 10/11：目录链接用 `mklink /J`（Junction，免管理员）；单文件共享用 hard link。脚本优先尝试 `os.symlink`，失败才回退 `mklink /J`，因此 Linux/macOS 上 `os.symlink` 可用的环境同样能跑
 - PowerShell 5.1+（仅 `sync-agent-memory.ps1` 需要）
 - 一个「技能真实目录」（各技能目录里都有 `SKILL.md`），以及一个不被引擎扫描的保管库目录
@@ -89,6 +90,28 @@ powershell -NoProfile -ExecutionPolicy Bypass -File sync-agent-memory.ps1 -Check
 
 所有写操作都幂等；`--check` 退出码 1 表示漂移，可直接放进 CI 或 pre-commit。
 
+## 图形界面（推荐）
+
+```bash
+python awb_gui.py             # 或双击 awb_gui.pyw / run_gui.bat
+python awb_gui.py --selftest  # 无窗口自检，失败返回非 0
+python awb_gui.py --once      # 跑一次只读动作后退出
+```
+
+界面只依赖 Python 自带的 tkinter。五个页签：
+
+| 页签 | 能做什么 |
+|---|---|
+| **技能分配矩阵** | 行 = 保管库里的全部技能，列 = 全局 + 各工作空间，交叉处打勾。点列头切换整列，点技能名切换整行；支持按工作空间名 / 技能名过滤、只显示已启用的工作空间。点「保存并应用」写 `skills-matrix.json` 并执行 `scope_skills.py --apply` |
+| **共享工作空间** | 选一个工作空间：建立 / 刷新 canonical、状态、落盘即见验证、漂移检查、快照、恢复快照、溯源某个 agent 路径来自哪个 canonical |
+| **跨 agent 投影** | 预览或把专属技能铺到各家项目级目录，同时列出路径对照表 |
+| **规则同步** | `-Status` / `-Lint` / `-DryRun -Update` / `-Update` / `-Check` 一键执行，输出直接显示在日志区 |
+| **维护 / 关于** | 取消隔离、清理残留目录、打开分配表 / 矩阵 / snippet / 日志、再跑一次自检 |
+
+界面只负责编辑事实源、拼命令、显示输出；**所有实际操作仍由同目录的 CLI 脚本完成**，所以命令行与界面行为完全一致，随时可以脱离界面使用。
+
+`skills-matrix.json` 生成在 `config_dir` 下（默认与分配表同目录）。存在时它就是唯一事实源，`rules` / `bundles` 完全不参与；删掉它（界面上「从规则表重建」会先备份成 `.bak-<时间戳>`）就回到规则表模式。日志写在仓库目录的 `awb_gui.log`，512 KB 轮转。
+
 ## 文件清单
 
 | 文件 | 职责 |
@@ -103,8 +126,22 @@ powershell -NoProfile -ExecutionPolicy Bypass -File sync-agent-memory.ps1 -Check
 | `cross_agent_skills.py` | 把分配表投影到各客户端项目级 skills 目录（默认 dry-run，`--apply` 才写），不动任何用户级池 |
 | `skill_restore.py` | 取消隔离：把保管库全量放回用户级目录 |
 | `sync-agent-memory.ps1` | 把 snippet 里的 `<!-- block -->…<!-- /block -->` 逐块同步到各客户端规则文件，`-DryRun` / `-Check` / `-Lint` / `-Status` / `-Update` |
+| `awb_matrix.py` | 技能 × 工作空间矩阵：界面勾选的事实源，也是各 CLI 的统一解析层；无矩阵时把规则表展开 |
+| `awb_gui.py` / `awb_gui.pyw` / `run_gui.bat` | 五页图形控制台与双击启动器；`--selftest` / `--once` 支持无窗口自检 |
+| `skills-matrix.json` | 界面生成的勾选结果（本机状态，被 `.gitignore` 忽略，不提交） |
 
 ## 命令参考
+
+### awb_gui.py
+
+```bash
+python awb_gui.py                     # 打开窗口
+python awb_gui.py --selftest          # 无窗口自检，失败返回非 0
+python awb_gui.py --once              # 只读动作一次后退出
+```
+
+`--selftest` 检查配置路径、矩阵加载、脚本齐备、日志可写、子进程可执行、单实例互斥量；
+`--check` 的退出码 1 同样适合挂 CI。打包成 exe 时可用 `AWB_ROOT` 指向脚本目录、`AWB_PYTHON` 指向解释器。
 
 ### scope_skills.py
 

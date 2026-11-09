@@ -36,7 +36,8 @@ import argparse
 import subprocess
 import datetime
 
-from awb_config import WORKSPACE_ROOT as ROOT, CFG, REAL
+from awb_config import WORKSPACE_ROOT as ROOT, CFG, REAL, MATRIX
+import awb_matrix as M
 REPARSE_POINT = 0x400
 
 AGENT_SKILL_DIRS = [
@@ -56,13 +57,8 @@ def vault_names():
 
 
 def bundles_for(name, cfg):
-    for r in cfg.get("rules", []):
-        if re.search(r["match"], name):
-            out = []
-            for b in r.get("bundles", []):
-                out.extend(cfg["bundles"].get(b, []))
-            return out
-    return []
+    """委托矩阵层：界面勾选的矩阵存在时为准，否则回退到 rules/bundles。"""
+    return M.bundles_for(name, cfg)[0]
 
 
 def ws_names(name, cfg):

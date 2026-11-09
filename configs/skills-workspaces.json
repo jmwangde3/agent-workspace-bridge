@@ -1,5 +1,5 @@
 {
-  "note": "示例分配表。global = 所有工作空间可见；rules 第一条命中生效，未命中的工作空间只有 global。改分类只改本文件，再跑 python scope_skills.py --apply。示例中的工作空间名请换成你自己的。",
+  "note": "示例分配表。global = 所有工作空间可见；rules 第一条命中生效，未命中的工作空间只有 global。改分类只改本文件，再跑 python scope_skills.py --apply。若 config_dir 下存在 skills-matrix.json（图形界面生成），本文件的 rules/bundles 不参与；删掉矩阵文件才回到本表。示例中的工作空间名请换成你自己的。",
   "workspace_root": "<在 config.json 的 workspace_root 指定>",
   "vault": "<在 config.json 的 skills_vault 指定>",
   "global": [

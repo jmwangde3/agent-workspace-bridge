@@ -18,6 +18,7 @@ DEFAULTS = {
     "skills_real": "~/.agent_skills/skills",
     "snippet": "~/.workbuddy/agent-memory-snippet.md",
     "skills_workspaces": "<config_dir>/skills-workspaces.json",
+    "skills_matrix": "<config_dir>/skills-matrix.json",
     "agent_skill_paths": "<config_dir>/agent-skill-paths.json",
 }
 
@@ -55,5 +56,6 @@ USER = C["skills_user"]
 REAL = C["skills_real"]
 SNIPPET = C["snippet"]
 CFG = C["skills_workspaces"]
+MATRIX = C["skills_matrix"]
 AGENT_PATHS = C["agent_skill_paths"]
 POSIX_REAL = _posix(REAL)
