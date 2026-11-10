@@ -11,6 +11,7 @@ import datetime
 import threading
 import subprocess
 import traceback
+from pathlib import Path
 
 FROZEN = getattr(sys, "frozen", False)
 BASE = os.path.dirname(sys.executable) if FROZEN else os.path.dirname(os.path.abspath(__file__))
@@ -24,12 +25,13 @@ from tkinter import ttk, messagebox, filedialog, font as tkfont
 import awb_config as C
 from awb_session_panel import SessionPanel
 
-VERSION = "1.7.0"
+VERSION = "1.7.1"
 APP_TITLE = "AWB 控制台 · 会话与共享记忆"
 OFFSCREEN = "--offscreen" in sys.argv   # 无打扰的窗口测试：把窗口放到屏幕外
 
 LOG_DIR = os.path.join(C.DATA_DIR, "logs")
 LOG_FILE = os.path.join(LOG_DIR, "awb_gui.log")
+SELFTEST_FILE = Path(C.DATA_DIR) / "diagnostics" / "awb_selftest.json"
 NATIVE_SYNC = "experiments/native_session_sync/workspace_sync.py"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -129,26 +131,29 @@ class Runner:
         self.pending = []
         self.final = self.failed = None
         self.private_line = None
+        self.notice = None
         self.label = ""
 
-    def run_many(self, jobs, final=None, failed=None, private_line=None):
+    def run_many(self, jobs, final=None, failed=None, private_line=None, notice=None):
         if self.busy:
             return False
         self.pending = list(jobs)
         self.final, self.failed = final, failed
         self.private_line = private_line
+        self.notice = notice
         self.busy = True
         self.busy_fn(True)
         self._next()
         return True
 
-    def run(self, label, argv, enc="utf-8", after=None, failed=None, private_line=None):
-        return self.run_many([(label, argv, enc)], final=after, failed=failed, private_line=private_line)
+    def run(self, label, argv, enc="utf-8", after=None, failed=None, private_line=None, notice=None):
+        return self.run_many([(label, argv, enc)], final=after, failed=failed, private_line=private_line, notice=notice)
 
     def _finish(self, rc):
         callback = self.final if rc == 0 else self.failed
         self.final = self.failed = None
         self.private_line = None
+        self.notice = None
         self.pending = []
         self.busy = False
         self.busy_fn(False)
@@ -176,7 +181,7 @@ class Runner:
                 self.q.put(("done", process.wait()))
         except Exception as error:
             self.q.put(("line", "ERROR: " + str(error)))
-            self.q.put(("done", 1))
+            self.q.put(("done", 2))
 
     def _poll(self):
         try:
@@ -185,6 +190,10 @@ class Runner:
                 if kind == "line":
                     if not self.private_line or not self.private_line(value):
                         self.log(value)
+                elif value == 1 and self.notice:
+                    self.status(self.notice)
+                    self._finish(value)
+                    return
                 elif value != 0:
                     self.status("失败：%s（退出码 %d），请查看日志" % (self.label, value))
                     self.log("操作失败；后续步骤已停止。")
@@ -381,6 +390,7 @@ class App:
             handlers=[logging.handlers.RotatingFileHandler(
                 LOG_FILE, maxBytes=512 * 1024, backupCount=2, encoding="utf-8")],
         )
+        logging.info("Configuration source: %s", C.SOURCE or "defaults")
 
     def _build_footer(self):
         bar = ttk.Frame(self.root, padding=(10, 6))
@@ -528,7 +538,9 @@ class App:
     def rules(self, label, flags):
         argv = [PS, "-NoProfile", "-ExecutionPolicy", "Bypass", "-File",
                 script("sync-agent-memory.ps1"), "-Snippet", C.SNIPPET] + flags.split()
-        self.runner.run("规则同步 · " + label, argv, enc="mbcs")
+        notice = {"-Check": "检测到规则差异，请查看日志。",
+                  "-Lint": "源规则检查有提示，请查看日志。"}.get(flags)
+        self.runner.run("规则同步 · " + label, argv, enc="mbcs", notice=notice)
 
     def _render_status(self):
         text = getattr(self, '_status_full', self.operation_status)
@@ -680,13 +692,34 @@ def _acquire_mutex():
 
 def main():
     args = sys.argv[1:]
+    if "--selftest-output" in args and ("--selftest" not in args or
+                                        args.index("--selftest-output") + 1 >= len(args) or
+                                        args[args.index("--selftest-output") + 1].startswith("--")):
+        print("SELFTEST_ERROR --selftest-output requires --selftest and a file path", file=sys.stderr)
+        return 2
     if "--selftest" in args:
-        ok, lines = run_selftest()
-        with open(os.path.join(BASE, "awb_selftest.json"), "w", encoding="utf-8") as handle:
-            json.dump({"version": VERSION, "ok": ok, "checks": lines}, handle, ensure_ascii=False, indent=2)
+        output = Path(args[args.index("--selftest-output") + 1]) if "--selftest-output" in args else SELFTEST_FILE
+        ok, lines = (False, ["CONFIG_ERROR " + str(C.ERROR)]) if C.ERROR else run_selftest()
+        try:
+            output.parent.mkdir(parents=True, exist_ok=True)
+            output.write_text(json.dumps({"version": VERSION, "ok": ok, "checks": lines},
+                                         ensure_ascii=False, indent=2), encoding="utf-8")
+        except (OSError, ValueError) as error:
+            detail = f"SELFTEST_ERROR {output}: {error}"
+            print(detail, file=sys.stderr)
+            _crash_log(detail)
+            return 2
         for l in lines:
             print(l)
         return 0 if ok else 1
+    if C.ERROR:
+        detail = "CONFIG_ERROR " + str(C.ERROR)
+        _crash_log(detail)
+        if "--once" in args:
+            print(detail, file=sys.stderr)
+        else:
+            messagebox.showerror(APP_TITLE, "无法读取 AWB 配置。\n\n" + str(C.ERROR))
+        return 2
     if "--once" in args:
         return run_once()
 
@@ -699,8 +732,9 @@ def main():
         root = tk.Tk()
         App(root)
         root.mainloop()
-    except Exception:
+    except Exception as error:
         _crash_log(traceback.format_exc())
+        messagebox.showerror(APP_TITLE, "无法启动 AWB。\n\n" + str(error))
         return 1
     return 0
 

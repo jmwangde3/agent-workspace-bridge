@@ -2,11 +2,13 @@ import datetime
 import io
 import json
 from pathlib import Path
+import struct
 import tempfile
 import tkinter as tk
 import unittest
 from unittest.mock import patch
 import zipfile
+import zlib
 
 import awb_gui as G
 import awb_links as L
@@ -135,3 +137,67 @@ class MemoryTests(unittest.TestCase):
                 with patch("sys.argv", ["share_workspace.py", "--all", *flags]):
                     self.assertEqual(W.main(), expected)
         self.assertEqual(W.check(str(ws)), 0)
+
+    def test_archive_budgets_reject_restore_and_backup_without_publishing(self):
+        ws = self.root / "w1"
+        self.build()
+        memory = ws / ".shared" / "memory"
+        for index in range(2):
+            (memory / f"fixture-{index}").write_bytes(b"x" * 20)
+        archive = B.backup(ws, memory)
+        folder = archive.parent
+        for field, limit in (("MAX_FILES", 1), ("MAX_FILE_SIZE", 19), ("MAX_TOTAL_SIZE", 30), ("MAX_ZIP_SIZE", 32),
+                             ("MAX_MANIFEST_SIZE", 32)):
+            with self.subTest(field=field), patch.object(B, field, limit):
+                with self.assertRaises(ValueError):
+                    B.recover(ws, memory, archive)
+                with self.assertRaises(ValueError):
+                    B.backup(ws, memory)
+                self.assertEqual(list(folder.iterdir()), [archive])
+                self.assertFalse(list(memory.parent.glob("*recover*")))
+
+    def test_archive_rejects_false_central_size_and_case_duplicates(self):
+        ws = self.root / "w1"
+        self.build()
+        memory = ws / ".shared" / "memory"
+        path = self.root / "invalid.zip"
+        name = "memory/sample.md"
+        identity = B.digest(io.BytesIO(b"x"))
+        manifest = {"version": 1, "workspace": L.normalized(ws), "files": {"sample.md": identity}}
+        with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+            archive.writestr(name, b"x" * 100)
+            archive.writestr("manifest.json", json.dumps(manifest))
+        data = bytearray(path.read_bytes())
+        start = data.index(b"PK\x01\x02")
+        struct.pack_into("<I", data, start + 16, zlib.crc32(b"x"))
+        struct.pack_into("<I", data, start + 24, 1)
+        path.write_bytes(data)
+        with self.assertRaisesRegex(ValueError, "decoded beyond"):
+            B.recover(ws, memory, path)
+        with zipfile.ZipFile(path, "w") as archive:
+            archive.writestr(name, b"x")
+            archive.writestr(name.upper(), b"x")
+            archive.writestr("manifest.json", json.dumps(manifest))
+        with self.assertRaisesRegex(ValueError, "Unsupported archive entry"):
+            B.recover(ws, memory, path)
+        self.assertFalse(list(memory.parent.glob("*recover*")))
+
+    def test_interrupted_extraction_leaves_no_finished_recovery(self):
+        ws = self.root / "w1"
+        self.build()
+        memory = ws / ".shared" / "memory"
+        note = memory / "MEMORY.md"
+        before = note.read_bytes()
+        archive = B.backup(ws, memory)
+        original = B.digest_chunks
+
+        def interrupt(chunks, output=None, limit=None):
+            if output is not None and not isinstance(output, io.BytesIO):
+                output.write(b"partial")
+                raise KeyboardInterrupt
+            return original(chunks, output, limit)
+
+        with patch.object(B, "digest_chunks", side_effect=interrupt), self.assertRaises(KeyboardInterrupt):
+            B.recover(ws, memory, archive)
+        self.assertEqual(note.read_bytes(), before)
+        self.assertFalse(list(memory.parent.glob("*recover*")))

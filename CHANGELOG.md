@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.1
+
+- Make rule distribution read-only by default and separate drift from errors.
+- Report explicit configuration errors and write self-tests to the user diagnostics directory.
+- Bound memory archive metadata and streamed extraction, and publish recovered directories only after verification.
+
 ## 1.7.0
 
 - Separate shared memory link records from verified ZIP content backups and recoveries. Include new workspaces in bulk build and check.

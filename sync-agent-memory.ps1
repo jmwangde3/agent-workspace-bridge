@@ -9,7 +9,13 @@ param(
     [switch]$TargetsOnly
 )
 $ErrorActionPreference = 'Stop'
-if ($Check -or $Status) { $DryRun = $true; $Update = $true }
+$operationCount = @($Status, $Check, $Lint, $Update | Where-Object { $_ }).Count
+if ($operationCount -gt 1) {
+    Write-Output 'RULE_ERROR=Choose only one of -Status, -Check, -Lint, -Update'
+    exit 2
+}
+if (!$operationCount -and !$DryRun) { $Status = $true }
+$allowWrite = $Update -and !$DryRun
 $u8 = [System.Text.UTF8Encoding]::new($false, $true)
 $marker = [regex]'<!--[ \t]*(?<end>/)?(?<name>[a-z0-9-]+)[ \t]*-->'
 
@@ -178,7 +184,12 @@ $relative = @(
 )
 $targets = @($ExtraTargets)
 if (!$TargetsOnly) { $targets = @($relative | ForEach-Object { Join-Path $env:USERPROFILE $_ }) + $targets }
-$targets = @($targets | ForEach-Object { [IO.Path]::GetFullPath($_) } | Select-Object -Unique)
+try {
+    $targets = @($targets | ForEach-Object { [IO.Path]::GetFullPath($_) } | Select-Object -Unique)
+} catch {
+    Write-Output ('RULE_ERROR=' + $_.Exception.Message)
+    exit 2
+}
 if (!$targets.Count) { Write-Output 'RULE_ERROR=No targets'; exit 2 }
 $drift = 0
 $errors = 0
@@ -186,21 +197,21 @@ foreach ($target in $targets) {
     try {
         if (!(Test-Path -LiteralPath $target)) {
             $drift += $blocks.Count
-            if ($DryRun) { Write-Output ('WOULD_CREATE=' + $target); continue }
+            if (!$allowWrite) { Write-Output ('WOULD_CREATE=' + $target); continue }
             Write-RuleText $target ($source.Text.Trim() + $source.Eol) $null
             Write-Output ('CREATED=' + $target)
             continue
         }
         if ([IO.File]::GetAttributes($target) -band [IO.FileAttributes]::ReparsePoint) { throw 'Target is a link' }
         $record = Read-RuleText $target
-        $plan = Render-ManagedBlocks $record $blocks $known $Update.IsPresent
+        $plan = Render-ManagedBlocks $record $blocks $known $true
         $drift += $plan.Changes.Count
         if (!$plan.Changes.Count) { continue }
-        if (!$DryRun) { Write-RuleText $target $plan.Text $record }
+        if ($allowWrite) { Write-RuleText $target $plan.Text $record }
         foreach ($change in $plan.Changes) {
             $verb, $name = $change -split ' ', 2
             $label = @{ APPEND = 'APPENDED'; UPDATE = 'UPDATED' }[$verb]
-            if ($DryRun) { $label = 'WOULD_' + $verb }
+            if (!$allowWrite) { $label = 'WOULD_' + $verb }
             Write-Output ($label + '=' + $target + ' BLOCK=' + $name)
         }
     } catch {

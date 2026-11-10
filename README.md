@@ -40,3 +40,9 @@ python -B share_workspace.py --workspace '项目名' --restore-memory '<备份 Z
 每个托管块使用独占一行的 `<!-- name -->` 和 `<!-- /name -->`，允许空块。目标中与源无关的 HTML 注释按原文保留。遇到重复、嵌套、未闭合或错误编码时，该目标保留原样，脚本退出码为 2。`-Check` 发现差异时返回 1。`-Lint` 单独检查源。`-DryRun -Update` 预演目标变更。
 
 更新现有目标前会生成经读回校验的同目录临时文件，并在替换时留下唯一备份。链接文件、硬链接和无法确认替换条件的文件会报错。日志中的 `BACKUP=` 和 `STAGED_FILE=` 分别记录备份和保留的临时文件位置。规则备份由用户在验收后按需清理。
+
+规则脚本无操作参数时按 `-Status` 只读执行。只有单独指定 `-Update` 且未加 `-DryRun` 时写入。检查发现差异返回 1，参数、解析或 I/O 错误返回 2。
+
+显式设置 `AWB_CONFIG` 时，路径和 JSON 必须有效。自检默认写入 `%LOCALAPPDATA%\AWB\diagnostics\awb_selftest.json`，也可用 `--selftest --selftest-output '<文件路径>'` 指定。崩溃日志与 GUI 日志放在 `%LOCALAPPDATA%\AWB\logs`。
+
+记忆 ZIP 的上限为压缩包 512 MiB、10,000 个正文文件、单文件 256 MiB、正文解压总量 2 GiB，manifest 和中央目录各 16 MiB。恢复先核对元数据，再按实际读取字节和摘要验证。完成前只使用标为 `.partial` 的暂存目录。
