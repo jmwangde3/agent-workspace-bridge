@@ -25,7 +25,7 @@ from tkinter import ttk, messagebox, filedialog, font as tkfont
 import awb_config as C
 from awb_session_panel import SessionPanel
 
-VERSION = "1.7.1"
+VERSION = "1.8.0-rc.1"
 APP_TITLE = "AWB 控制台 · 会话与共享记忆"
 OFFSCREEN = "--offscreen" in sys.argv   # 无打扰的窗口测试：把窗口放到屏幕外
 
@@ -250,11 +250,30 @@ class App:
             self.sync_list.insert("end", name)
         bar = ttk.Frame(self.tab_sync)
         bar.pack(fill="x", pady=6)
+        self.sync_blocked = set()
+        self.sync_writes = []
         for text, action in (("只读预览", "preview"), ("开始常驻监控", "monitor"), ("合并后打开两端", "launch")):
-            ttk.Button(bar, text=text, command=lambda mode=action: self.sync_action(mode)).pack(side="left", padx=(0, 8))
-        ttk.Button(bar, text="删除两端副本…", command=self.review_delete).pack(side="left")
+            button = ttk.Button(bar, text=text, command=lambda mode=action: self.sync_action(mode))
+            button.pack(side="left", padx=(0, 8))
+            if action != "preview":
+                self.sync_writes.append(button)
+        delete = ttk.Button(bar, text="删除两端副本…", command=self.review_delete)
+        delete.pack(side="left", padx=(0, 8))
+        self.sync_writes.append(delete)
+        ttk.Button(bar, text="兼容与恢复诊断", command=lambda: self.sync_action("diagnose")).pack(side="left")
+        self.sync_list.bind("<<ListboxSelect>>", lambda _: self.refresh_sync_writes())
         ttk.Label(self.tab_sync, text="两端退出后同步正文和归档状态。工具、附件和归档冲突会暂缓。删除前请在监控终端按 Ctrl+C。",
                   wraplength=850).pack(anchor="w", pady=6)
+
+    def selected_sync_workspaces(self):
+        return [os.path.join(C.WORKSPACE_ROOT, self.sync_list.get(index))
+                for index in self.sync_list.curselection()]
+
+    def refresh_sync_writes(self):
+        blocked = any(os.path.normcase(os.path.realpath(path)) in self.sync_blocked
+                      for path in self.selected_sync_workspaces())
+        for button in self.sync_writes:
+            button.configure(state="disabled" if blocked else "normal")
 
     def review_delete(self):
         if self.runner.busy:
@@ -320,14 +339,36 @@ class App:
     def sync_action(self, action):
         if self.runner.busy:
             return
-        selected = [self.sync_list.get(index) for index in self.sync_list.curselection()]
+        selected = self.selected_sync_workspaces()
         if not selected:
             messagebox.showinfo(APP_TITLE, "先选择一个或多个工作空间。")
             return
         argv = [PY, "-B", "-X", "utf8", script(NATIVE_SYNC), action]
-        argv.extend(os.path.join(C.WORKSPACE_ROOT, name) for name in selected)
+        argv.extend(selected)
         argv.append("--compatible-only")
-        if action in ("preview", "launch"):
+        if action == "diagnose":
+            seen, blocked = set(), set()
+            current = None
+
+            def inspect_line(line):
+                nonlocal current
+                if line.startswith("WORKSPACE "):
+                    current = os.path.normcase(os.path.realpath(line.removeprefix("WORKSPACE ")))
+                    seen.add(current)
+                elif current and (line.startswith("RECOVERY_REQUIRED ")
+                                  or (line.startswith("SCHEMA ") and "READ_WRITE_SUPPORTED" not in line)):
+                    blocked.add(current)
+                return False
+
+            def update():
+                self.sync_blocked.difference_update(seen)
+                self.sync_blocked.update(blocked)
+                self.refresh_sync_writes()
+                if blocked:
+                    self.set_status("部分工作空间禁止写入，请查看诊断和操作 ID。")
+
+            self.runner.run("会话兼容与恢复诊断", argv, after=update, private_line=inspect_line)
+        elif action in ("preview", "launch"):
             label = "会话同步预览" if action == "preview" else "等待两端退出 · 合并后打开"
             self.runner.run(label, argv)
         else:
@@ -370,6 +411,7 @@ class App:
             self.sync_list.insert("end", name)
             if name in selected:
                 self.sync_list.selection_set(index)
+        self.refresh_sync_writes()
 
     def refresh_status(self):
         self._status_full = self.operation_status
@@ -611,7 +653,9 @@ def run_selftest():
     chk("工作空间根存在", os.path.isdir(C.WORKSPACE_ROOT), C.WORKSPACE_ROOT)
     chk("规则块源存在", os.path.isfile(C.SNIPPET), C.SNIPPET)
     for f in ("share_workspace.py", "awb_memory_backup.py", "sync-agent-memory.ps1", "awb_sessions.py", "awb_session_panel.py", NATIVE_SYNC,
-              "experiments/native_session_sync/session_lifecycle.py", "experiments/native_session_sync/probe_codex.py"):
+              "experiments/native_session_sync/session_lifecycle.py", "experiments/native_session_sync/probe_codex.py",
+              "experiments/native_session_sync/storage_schema.py", "experiments/native_session_sync/sync_journal.py",
+              "experiments/native_session_sync/sync_recovery.py"):
         chk("脚本存在 " + f, os.path.isfile(script(f)))
     try:
         os.makedirs(LOG_DIR, exist_ok=True)

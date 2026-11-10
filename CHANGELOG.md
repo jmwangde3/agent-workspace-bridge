@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.8.0-rc.1
+
+- Gate native writes on recognized Codex and WorkBuddy storage schemas.
+- Persist original projection and lifecycle plans with verified backup references and per-target checkpoints.
+- Verify native history, visibility and database integrity before reporting success. Add diagnostics and reviewed recovery of interrupted writes.
+
 ## 1.7.1
 
 - Make rule distribution read-only by default and separate drift from errors.

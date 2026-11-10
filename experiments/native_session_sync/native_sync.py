@@ -123,7 +123,7 @@ def workbuddy_user_text(event, text, number):
     return text
 
 
-def read_messages(path, agent):
+def read_messages(path, agent, expected_session_id=None):
     messages = []
     with path.open(encoding="utf-8-sig") as handle:
         if agent == "codex":
@@ -147,6 +147,8 @@ def read_messages(path, agent):
                 event = event.get("payload", {})
             elif workbuddy_log_metadata(event):
                 continue
+            elif expected_session_id is not None and event.get("sessionId") not in (None, expected_session_id):
+                raise ValueError("WorkBuddy message references another session")
             role = event.get("role")
             parts = event.get("content")
             expected = "input_text" if role == "user" else "output_text"
@@ -297,9 +299,11 @@ class Lab:
             with closing(sqlite3.connect(self.wb_db)) as db, db:
                 db.execute("BEGIN IMMEDIATE")
                 if current:
+                    workspace_match = "cwd=? COLLATE NOCASE" if os.name == "nt" else "cwd=?"
                     updated = db.execute("UPDATE sessions SET updated_at=?, last_activity_at=? "
-                                         "WHERE id=? AND user_id=? AND deleted_at IS NULL",
-                                         (stamp, stamp, sid, self.owner))
+                                         "WHERE id=? AND user_id=? AND deleted_at IS NULL "
+                                         "AND lower(status)='completed' AND transport='local' AND " + workspace_match,
+                                         (stamp, stamp, sid, self.owner, cwd))
                     if updated.rowcount != 1:
                         raise ValueError("WorkBuddy session owner or visibility changed")
                 else:
@@ -322,7 +326,7 @@ class Lab:
     def sync_lock(self):
         return exclusive_file_lock(self.local("sync.lock"), "An offline sync is already running")
 
-    def _sync(self, before_write=None, native=None, deferred_groups=(), reserved=None):
+    def _sync(self, before_write=None, native=None, deferred_groups=(), reserved=None, prepare=None, project=None):
         if before_write:
             before_write()
         if native is None:
@@ -370,13 +374,18 @@ class Lab:
                         db.execute("INSERT INTO copies VALUES (?,?,?)", (agent, sid, gid))
                     elif sid in reserved[agent]:
                         raise ValueError("A planned replica collides with a deferred native session")
-                    projections.append((agent, sid, title, messages))
+                    projections.append((gid, agent, sid, title, messages))
+            if prepare:
+                prepare(db, projections, branches)
         # Intent is committed first. Deterministic replica IDs allow an interrupted projection to retry.
         stats = {"sessions": len(projections) // len(AGENTS), "branches": branches,
                  "created": 0, "extended": 0, "unchanged": 0}
-        for agent, sid, title, messages in projections:
-            if before_write:
-                before_write()
-            result = self.publish(agent, sid, title, messages, native[agent].get(sid))
+        for ordinal, (_, agent, sid, title, messages) in enumerate(projections):
+            if project:
+                result = project(ordinal, agent, sid, title, messages, native[agent].get(sid))
+            else:
+                if before_write:
+                    before_write()
+                result = self.publish(agent, sid, title, messages, native[agent].get(sid))
             stats[result] += 1
         return stats

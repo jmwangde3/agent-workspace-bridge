@@ -4,9 +4,12 @@ from contextlib import closing, redirect_stdout
 from dataclasses import replace
 from io import StringIO
 import json
+import errno
 import os
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -15,12 +18,14 @@ import zipfile
 
 from backup_lab import verify
 import codex_rollout as cx
+import native_sync
 from native_sync import Lab, OWNER, read_messages, stable
 from offline_sync import ClientActive, OfflineSync
 from probe_codex import Codex
 from test_native_sync import pair
 from test_offline_sync import Clock
 from workspace_sync import WorkspaceBatch, WorkspaceSync, report_results, run_cycles
+from sync_recovery import inspect_recovery, recover
 
 
 class WorkspaceGateCases(unittest.TestCase):
@@ -58,17 +63,26 @@ class WorkspaceGateCases(unittest.TestCase):
 
     def test_unknown_readable_schema_blocks_first_write(self):
         with closing(sqlite3.connect(self.store.wb_db)) as db, db:
-            db.execute("ALTER TABLE sessions ADD COLUMN unknown_metadata TEXT")
+            db.execute("ALTER TABLE sessions ADD COLUMN unknown_metadata TEXT NOT NULL DEFAULT ''")
         original = {path: path.read_bytes() for path in (self.store.wb_db, self.store.codex_db, self.a_path)}
         report = self.store.schema_reports()[1]
         self.assertFalse(report.invalid_columns)
         self.assertFalse(report.write_supported)
-        self.assertIn("READ_SUPPORTED UNKNOWN_SCHEMA", report.describe())
+        self.assertIn("READ_ONLY_SUPPORTED UNKNOWN_SCHEMA", report.describe())
         with self.assertRaisesRegex(ValueError, "UNKNOWN_SCHEMA"):
             self.store.sync(lambda: None)
         self.assertFalse(self.store.state.exists())
         for path, expected in original.items():
             self.assertEqual(path.read_bytes(), expected)
+
+    def test_known_schema_allows_only_inert_optional_columns(self):
+        with closing(sqlite3.connect(self.store.wb_db)) as db, db:
+            db.execute("ALTER TABLE sessions ADD COLUMN new_note TEXT")
+            db.execute("ALTER TABLE sessions ADD COLUMN new_index INTEGER")
+        self.assertTrue(self.store.schema_reports()[1].write_supported)
+        with closing(sqlite3.connect(self.store.wb_db)) as db, db:
+            db.execute("CREATE TRIGGER unknown AFTER INSERT ON sessions BEGIN SELECT 1; END")
+        self.assertFalse(self.store.schema_reports()[1].write_supported)
 
     def test_mistyped_or_missing_columns_block_even_read_validation(self):
         with closing(sqlite3.connect(self.store.wb_db)) as db, db:
@@ -482,7 +496,11 @@ class WorkspaceGateCases(unittest.TestCase):
         self.assertTrue(any(name.endswith(wb.path.name) for name in paths))
         record, _ = next(lifecycle.delete_candidates(a[0]))
         self.assertEqual(record["states"], ["missing", "active"])
-        lifecycle.delete(record["token"], lambda: None)
+        with self.assertRaisesRegex(ValueError, "RECOVERY_REQUIRED"):
+            lifecycle.delete(record["token"], lambda: None)
+        pending = self.store.journal.pending()
+        self.assertEqual(inspect_recovery(self.store, pending["id"])["kind"], "delete")
+        recover(self.store, pending["id"], lambda: None)
         self.assertTrue(wb.path.is_file())
         self.assertEqual([r.state for r in lifecycle.replicas([a])[a[0]]], ["missing", "deleted"])
         self.assertEqual(self.lifecycle_sync()["deferred_groups"], 1)
@@ -495,6 +513,236 @@ class WorkspaceGateCases(unittest.TestCase):
             db.execute("UPDATE sessions SET deleted_at=10 WHERE id=?", (a[4],))
         self.assertEqual(self.lifecycle_sync()["deferred_groups"], 1)
         self.assertEqual([r.state for r in self.store.lifecycle.replicas([a])[a[0]]], ["active", "deleted"])
+
+    def restart_store(self):
+        old = self.store
+        self.store = WorkspaceSync(old.workspace, old.codex, old.workbuddy, old.root,
+                                   lambda: self.accounts, old.compatible_only, lambda _: [])
+        self.store.schemas = old.schemas
+
+    def verify_resumed_merge(self):
+        self.restart_store()
+        pending = self.store.journal.pending()
+        self.assertIsNotNone(pending)
+        op = pending["id"]
+        old_plan = json.loads(pending["plan"])
+        with self.assertRaisesRegex(ValueError, "RECOVERY_REQUIRED"):
+            self.store.sync(lambda: None)
+        report = inspect_recovery(self.store, op)
+        self.assertEqual(len(report["steps"]), 4)
+        self.assertEqual(recover(self.store, op, lambda: None)["verified_steps"], 4)
+        self.assertIsNone(self.store.journal.pending())
+        for agent in ("codex", "workbuddy"):
+            self.assertCountEqual([copy.messages for copy in self.store.copies(agent).values()], [self.a, self.b])
+        with closing(sqlite3.connect(self.store.state)) as db:
+            record = db.execute("SELECT state,plan FROM journal_operations WHERE id=?", (op,)).fetchone()
+            self.assertEqual(record[0], "RECOVERED")
+            self.assertEqual(json.loads(record[1]), old_plan)
+        for _ in range(10):
+            self.assertEqual(self.store.sync(lambda: None)["unchanged"], 4)
+
+    def test_actual_process_exit_after_prepared_preserves_plan(self):
+        child = """
+from dataclasses import replace
+from pathlib import Path
+import os
+import sys
+from workspace_sync import WorkspaceSync
+workspace, codex, workbuddy, state = map(Path, sys.argv[1:5])
+store = WorkspaceSync(workspace, codex, workbuddy, state, lambda: tuple(sys.argv[5:7]))
+store.schemas = tuple(replace(schema, write_fingerprints=frozenset({report.fingerprint}))
+                      for schema, report in zip(store.schemas, store.schema_reports()))
+store.project_step = lambda *args: os._exit(77)
+store.sync(lambda: None)
+"""
+        result = subprocess.run([sys.executable, "-B", "-c", child, str(self.store.workspace),
+                                 str(self.store.codex), str(self.store.workbuddy), str(self.store.root),
+                                 *self.accounts], cwd=Path(__file__).resolve().parent,
+                                capture_output=True, timeout=30)
+        self.assertEqual(result.returncode, 77, (result.stdout, result.stderr))
+        self.assertEqual(self.store.journal.pending()["state"], "PREPARED")
+        self.verify_resumed_merge()
+
+    def test_resume_after_codex_jsonl_before_index_commit(self):
+        with patch.object(self.store, "index_codex_copy", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.sync(lambda: None)
+        self.verify_resumed_merge()
+
+    def test_resume_workbuddy_jsonl_written_before_sqlite_commit(self):
+        atomic_text = native_sync.atomic_text
+
+        def interrupt(path, content):
+            atomic_text(path, content)
+            if path.is_relative_to(self.store.workbuddy):
+                raise KeyboardInterrupt
+
+        with patch.object(native_sync, "atomic_text", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.sync(lambda: None)
+        self.verify_resumed_merge()
+
+    def test_resume_after_native_commit_before_readback(self):
+        with patch.object(self.store, "verify_publication", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.sync(lambda: None)
+        self.verify_resumed_merge()
+
+    def test_resume_after_readback_before_operation_commit(self):
+        advance = self.store.journal.advance
+
+        def interrupt(operation, state, **changes):
+            if state == "COMMITTED":
+                raise KeyboardInterrupt
+            return advance(operation, state, **changes)
+
+        with patch.object(self.store.journal, "advance", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.sync(lambda: None)
+        self.assertEqual(self.store.journal.pending()["completed"], 4)
+        self.verify_resumed_merge()
+
+    def test_recovery_blocks_external_history_change_and_corrupt_backup(self):
+        with patch.object(self.store, "project_step", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.sync(lambda: None)
+        pending = self.store.journal.pending()
+        backup = self.store.local(pending["backup"])
+        before = backup.read_bytes()
+        backup.write_bytes(b"invalid backup")
+        with self.assertRaisesRegex(ValueError, "backup checksum"):
+            recover(self.store, pending["id"], lambda: None)
+        backup.write_bytes(before)
+        old = self.store.copies("workbuddy")[self.b_id]
+        messages = self.b + pair("external", "follow-up")
+        self.lab.publish("workbuddy", old.sid, old.title, messages, old)
+        history = old.path.read_bytes()
+        with self.assertRaisesRegex(ValueError, "Unexpected external history"):
+            recover(self.store, pending["id"], lambda: None)
+        self.assertEqual(old.path.read_bytes(), history)
+        self.assertEqual(self.store.journal.pending()["completed"], 0)
+
+    def test_readback_mismatch_blocks_remaining_projection(self):
+        original = self.store.verify_publication
+
+        def mismatch(agent, sid, title, messages, current):
+            wrong = messages + pair("wrong", "result")
+            original(agent, sid, title, wrong, current)
+
+        with patch.object(self.store, "verify_publication", side_effect=mismatch):
+            with self.assertRaisesRegex(ValueError, "publication verification failed"):
+                self.store.sync(lambda: None)
+        pending = self.store.journal.pending()
+        self.assertEqual((pending["state"], pending["completed"]), ("RECOVERY_REQUIRED", 0))
+        self.verify_resumed_merge()
+
+    def test_disk_full_after_plan_does_not_write_native_storage(self):
+        paths = (self.store.codex_db, self.store.wb_db, self.a_path)
+        before = {path: path.read_bytes() for path in paths}
+        with patch("workspace_sync.capture_files", side_effect=OSError(errno.ENOSPC, "fixture")):
+            with self.assertRaises(OSError):
+                self.store.sync(lambda: None)
+        self.assertIsNone(self.store.journal.pending())
+        with closing(sqlite3.connect(self.store.state)) as db:
+            self.assertEqual(db.execute("SELECT state,error FROM journal_operations").fetchone(),
+                             ("FAILED", "OSError"))
+        self.assertEqual({path: path.read_bytes() for path in paths}, before)
+        self.assertEqual(self.store.sync(lambda: None)["created"], 2)
+
+    def test_unprepared_backup_is_recoverable_without_replay(self):
+        with patch.object(self.store, "_sync", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.sync(lambda: None)
+        self.assertIsNone(self.store.journal.pending())
+        with closing(sqlite3.connect(self.store.state)) as db:
+            row = db.execute("SELECT state,backup_hash,plan FROM journal_operations").fetchone()
+            self.assertEqual(row[0], "FAILED")
+            self.assertIsNotNone(row[1])
+            self.assertIsNone(row[2])
+        self.assertEqual(len(self.store.copies("codex")), 1)
+        self.assertEqual(len(self.store.copies("workbuddy")), 1)
+        self.assertEqual(self.store.sync(lambda: None)["created"], 2)
+
+    def test_controller_lock_excludes_another_process(self):
+        from native_sync import exclusive_file_lock
+        lock = self.store.root.parent / "controller.lock"
+        child = """
+from pathlib import Path
+import sys
+from native_sync import exclusive_file_lock
+try:
+    with exclusive_file_lock(Path(sys.argv[1]), "busy"):
+        pass
+except RuntimeError:
+    sys.exit(77)
+"""
+        with exclusive_file_lock(lock, "busy"):
+            result = subprocess.run([sys.executable, "-B", "-c", child, str(lock)],
+                                    cwd=Path(__file__).resolve().parent, timeout=15, capture_output=True)
+        self.assertEqual(result.returncode, 77, (result.stdout, result.stderr))
+
+    def test_legacy_ledger_keeps_replica_ids_when_journal_is_added(self):
+        self.store.sync(lambda: None)
+        with closing(sqlite3.connect(self.store.state)) as db, db:
+            mappings = db.execute("SELECT * FROM copies ORDER BY agent,native").fetchall()
+            db.execute("DROP TABLE journal_operations")
+        self.restart_store()
+        wb = self.store.copies("workbuddy")[self.b_id]
+        extended = self.b + pair("legacy continuation", "reply")
+        self.lab.publish("workbuddy", wb.sid, wb.title, extended, wb)
+        self.assertEqual(self.store.sync(lambda: None)["extended"], 1)
+        with closing(sqlite3.connect(self.store.state)) as db:
+            self.assertEqual(db.execute("SELECT * FROM copies ORDER BY agent,native").fetchall(), mappings)
+            self.assertEqual(db.execute("SELECT state FROM journal_operations").fetchone(), ("COMMITTED",))
+
+    def test_database_change_between_prepare_and_apply_stops_writes(self):
+        project = self.store.project_step
+
+        def concurrent_edit(*args):
+            with closing(sqlite3.connect(self.store.wb_db)) as db, db:
+                db.execute("UPDATE sessions SET title='external edit' WHERE id='outside'")
+            return project(*args)
+
+        with patch.object(self.store, "project_step", side_effect=concurrent_edit):
+            with self.assertRaisesRegex(ValueError, "native database changed"):
+                self.store.sync(lambda: None)
+        self.assertEqual(self.store.journal.pending()["completed"], 0)
+        self.verify_resumed_merge()
+        with closing(sqlite3.connect(self.store.wb_db)) as db:
+            self.assertEqual(db.execute("SELECT title FROM sessions WHERE id='outside'").fetchone(), ("external edit",))
+
+    def test_invalid_plan_digest_blocks_replay(self):
+        with patch.object(self.store, "project_step", side_effect=KeyboardInterrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.store.sync(lambda: None)
+        pending = self.store.journal.pending()
+        with closing(sqlite3.connect(self.store.state)) as db, db:
+            db.execute("UPDATE journal_operations SET plan_hash='bad' WHERE id=?", (pending["id"],))
+        with self.assertRaisesRegex(ValueError, "plan checksum"):
+            recover(self.store, pending["id"], lambda: None)
+        self.assertEqual(len(self.store.copies("codex")), 1)
+
+    def test_archive_resume_after_native_state_change(self):
+        self.lifecycle_sync()
+        a = self.pair_a()
+        self.native_action(self.a_id, "archive")
+        advance = self.store.journal.advance
+
+        def interrupt(operation, state, **changes):
+            if state == "VERIFYING":
+                raise KeyboardInterrupt
+            return advance(operation, state, **changes)
+
+        with patch.object(self.store.journal, "advance", side_effect=interrupt):
+            with self.assertRaises(KeyboardInterrupt):
+                self.lifecycle_sync()
+        self.restart_store()
+        operation = self.store.journal.pending()["id"]
+        preview = inspect_recovery(self.store, operation)
+        self.assertEqual(preview["steps"], [{"group": a[0], "state": "after"}])
+        recover(self.store, operation, lambda: None)
+        self.assertIsNone(self.store.journal.pending())
+        self.assertEqual([item.state for item in self.store.lifecycle.replicas([a])[a[0]]], ["archived", "archived"])
 
     def test_account_change_and_archive_cannot_recreate_known_session(self):
         self.store.sync(lambda: None)

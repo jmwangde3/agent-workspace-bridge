@@ -14,13 +14,16 @@ import sqlite3
 import subprocess
 import time
 import uuid
+from zipfile import BadZipFile
 
-from backup_lab import capture_files
+from backup_lab import capture_files, file_hash, verify
 from native_sync import AGENTS, Copy, Lab, atomic_text, create_ledger, exclusive_file_lock, read_messages, stable
-from offline_sync import ClientActive, OfflineSync
+from offline_sync import ClientActive, OfflineSync, fingerprint_paths
 from probe_codex import Codex
 from session_lifecycle import SessionLifecycle
 from storage_schema import CODEX_SCHEMA, WORKBUDDY_SCHEMA
+from sync_journal import SyncJournal
+from sync_recovery import backup_path, confirm_projections, inspect_recovery, projection_plan, recover
 
 
 PROCESS_CHECK = r"""
@@ -113,6 +116,9 @@ class WorkspaceSync(Lab):
         self.client_check = client_check
         self.lifecycle = SessionLifecycle(self, read_db, same_workspace, native_path)
         self.schemas = (CODEX_SCHEMA, WORKBUDDY_SCHEMA)
+        self.journal = SyncJournal(self.state, self.binding)
+
+    read_db = staticmethod(read_db)
 
     def schema_reports(self):
         return [schema.detect_version(path) for schema, path in zip(self.schemas, (self.codex_db, self.wb_db))]
@@ -148,7 +154,7 @@ class WorkspaceSync(Lab):
 
     def read_copy(self, agent, sid, path, title, deferred):
         try:
-            messages = read_messages(path, agent)
+            messages = read_messages(path, agent, sid)
         except FileNotFoundError as error:
             self.defer(deferred, sid, "missing_history", error)
         except (ValueError, TypeError, KeyError, AttributeError) as error:
@@ -267,13 +273,17 @@ class WorkspaceSync(Lab):
     def deferred_counts(deferred):
         return {agent: dict(Counter(reasons.values())) for agent, reasons in deferred.items() if reasons}
 
-    def sync_paths(self):
+    def database_paths(self):
         paths = [self.wb_db, self.codex_db, *self.codex.glob("thread_history_*.sqlite")]
         for path in list(paths):
             paths.append(path.with_name(path.name + "-wal"))
+        paths.append(self.local("codex", "session_index.jsonl"))
+        return paths
+
+    def sync_paths(self):
+        paths = self.database_paths()
         paths.extend((self.codex / "sessions").rglob("rollout-*.jsonl"))
         paths.extend((self.codex / "archived_sessions").rglob("rollout-*.jsonl"))
-        paths.append(self.local("codex", "session_index.jsonl"))
         paths.extend(self.wb_path("sample").parent.glob("*.jsonl"))
         return paths
 
@@ -297,10 +307,18 @@ class WorkspaceSync(Lab):
             paths[agent + "/" + path.relative_to(getattr(self, agent)).as_posix()] = (path, False)
         return paths
 
-    def verified_backup(self, native, extra=()):
-        backup = self.local("before-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".zip")
+    def backup_destination(self):
+        return self.local("before-" + datetime.now().strftime("%Y%m%d-%H%M%S-%f") + ".zip")
+
+    def verified_backup(self, native, extra=(), backup=None):
+        if backup is None:
+            backup = self.backup_destination()
         capture_files(backup, self.backup_paths(native, extra))
         self.last_backup = backup
+
+    def checkpoint_backup(self, operation, native, extra, backup):
+        self.verified_backup(native, extra, backup)
+        self.journal.advance(operation, "BACKUP_VERIFIED", backup_hash=file_hash(backup))
 
     def codex_action(self, sid, action, guard):
         guard()
@@ -419,19 +437,104 @@ class WorkspaceSync(Lab):
                            + ",".join(":" + key for key in fields) + ")", fields)
         return True
 
-    def publish(self, agent, sid, title, messages, current=None):
+    def verify_publication(self, agent, sid, title, messages, current=None):
+        if agent == "codex":
+            with closing(read_db(self.codex_db)) as db:
+                row = db.execute(
+                    "SELECT cwd,creator_account_id,archived,rollout_path,archived_at FROM threads WHERE id=?", (sid,)
+                ).fetchone()
+                name = db.execute("SELECT title FROM threads WHERE id=?", (sid,)).fetchone()
+            item = self.lifecycle.codex_copy(sid, row, set())
+        else:
+            with closing(read_db(self.wb_db)) as db:
+                row = db.execute(
+                    "SELECT cwd,user_id,status,deleted_at,transport,updated_at FROM sessions WHERE id=?", (sid,)
+                ).fetchone()
+                name = db.execute("SELECT title FROM sessions WHERE id=?", (sid,)).fetchone()
+            item = self.lifecycle.wb_copy(sid, row)
+        if (item.state != "active" or (current is not None and item.path != current.path)
+                or (current is None and name != (title,)) or read_messages(item.path, agent, sid) != messages):
+            raise ValueError(f"Native publication verification failed for {agent}/{sid}")
+
+    def verify_integrity(self):
+        for name, path, table in (("Codex", self.codex_db, "threads"), ("WorkBuddy", self.wb_db, "sessions")):
+            with closing(read_db(path)) as db:
+                if (db.execute("PRAGMA quick_check").fetchall() != [("ok",)]
+                        or db.execute(f"PRAGMA foreign_key_check({table})").fetchone() is not None):
+                    raise ValueError(f"{name} native database integrity verification failed")
+
+    def publish(self, agent, sid, title, messages, current=None, verifying=None, before_index=None):
         if agent == "codex" and current is None:
             with closing(read_db(self.codex_db)) as db:
                 if db.execute("SELECT 1 FROM threads WHERE id=?", (sid,)).fetchone():
                     raise ValueError("A planned Codex replica ID is already in the desktop index")
+            if any(next((self.codex / folder).rglob("rollout-*" + sid + ".jsonl"), None) is not None
+                   for folder in ("sessions", "archived_sessions")):
+                raise ValueError("A planned Codex replica ID already has an unexpected transcript")
         managed = agent == "codex" and self.managed_codex_copy(sid, current is None)
         result = super().publish(agent, sid, title, messages, current)
         if managed:
+            if before_index:
+                before_index()
             path = current.path if current else next((self.codex / "sessions").rglob("rollout-*" + sid + ".jsonl"))
             self.codex_indexed += self.index_codex_copy(sid, path, title, messages)
+        if verifying:
+            verifying()
+        self.verify_publication(agent, sid, title, messages, current)
         with closing(sqlite3.connect(self.state)) as db, db:
             db.execute("INSERT OR IGNORE INTO published VALUES (?,?)", (agent, sid))
         return result
+
+    def project_step(self, operation, ordinal, agent, sid, title, messages, current, guard):
+        step = f"{ordinal}:{agent}/{sid}"
+        self.journal.advance(operation, "APPLYING", step=step)
+        guard()
+        result = self.publish(agent, sid, title, messages, current,
+                              verifying=lambda: self.journal.advance(operation, "VERIFYING", step=step),
+                              before_index=guard)
+        self.journal.advance(operation, "PREPARED", completed=ordinal + 1)
+        return result
+
+    def database_fence(self, guard):
+        expected = fingerprint_paths(self.database_paths())
+
+        def checked_guard():
+            guard()
+            if fingerprint_paths(self.database_paths()) != expected:
+                raise ValueError("A native database changed between write steps")
+
+        def refresh():
+            nonlocal expected
+            expected = fingerprint_paths(self.database_paths())
+
+        return checked_guard, refresh
+
+    def projection_executor(self, operation, guard, original=None):
+        checked_guard, refresh = self.database_fence(guard)
+        steps = None
+        digests = {}
+        done = set()
+
+        def execute(ordinal, agent, sid, title, messages, current):
+            nonlocal steps, digests
+            if original is not None:
+                if steps is None:
+                    steps = self.journal.reviewed(operation)[1]["steps"]
+                    digests = {(step["agent"], step["sid"]): step["before_file"] for step in steps}
+                expected_file = steps[ordinal]["before_file"]
+                if current is not None and file_hash(current.path) != expected_file:
+                    raise ValueError(f"Native transcript changed before projection for {agent}/{sid}")
+                peer_agent, peer_sid = steps[ordinal]["peer_agent"], steps[ordinal]["peer_sid"]
+                peer = original[peer_agent].get(peer_sid)
+                if peer is not None and (peer_agent, peer_sid) not in done:
+                    if file_hash(peer.path) != digests[(peer_agent, peer_sid)]:
+                        raise ValueError(f"Native source changed before projection for {agent}/{sid}")
+            result = self.project_step(operation, ordinal, agent, sid, title, messages, current, checked_guard)
+            done.add((agent, sid))
+            refresh()
+            return result
+
+        return execute
 
     def sync(self, before_write=None):
         if before_write is None:
@@ -446,6 +549,7 @@ class WorkspaceSync(Lab):
 
             guard()
             self.require_write_schema()
+            self.journal.require_idle()
             marker = self.local("scope.json")
             if not marker.exists():
                 atomic_text(marker, json.dumps(self.binding))
@@ -477,13 +581,28 @@ class WorkspaceSync(Lab):
                     raise ClientActive("Native files changed during the check")
                 return dict(sessions=len(native["codex"]), branches=0, created=0, extended=0,
                             unchanged=sum(len(copies) for copies in native.values()), **summary)
-            self.verified_backup(native)
-            guard()
-            if gate.fingerprint() != initial:
-                raise ClientActive("Native files changed during the backup")
-            self.require_write_schema()
-            self.codex_indexed = 0
-            result = self._sync(guard, native, deferred_groups, deferred)
+            backup = self.backup_destination()
+            with self.journal.operation("merge", initial, backup) as operation:
+                self.checkpoint_backup(operation, native, (), backup)
+                guard()
+                if gate.fingerprint() != initial:
+                    raise ClientActive("Native files changed during the backup")
+                self.require_write_schema()
+                self.codex_indexed = 0
+
+                def prepare(db, projections, branches):
+                    self.journal.prepare(db, operation, projection_plan(projections, native, branches))
+
+                project = self.projection_executor(operation, guard, original=native)
+                result = self._sync(guard, native, deferred_groups, deferred, prepare=prepare, project=project)
+                verify_snapshot = gate.fingerprint()
+                confirm_projections(self, operation)
+                self.verify_integrity()
+                guard()
+                if gate.fingerprint() != verify_snapshot:
+                    raise ValueError("Native files changed during final verification")
+                self.journal.advance(operation, "COMMITTED")
+                result["operation_id"] = operation
             if self.compatible_only:
                 self.lifecycle.observe()
             if self.codex_indexed:
@@ -616,13 +735,17 @@ def run_cycles(store, gate, continuous, pause=time.sleep, launch=None):
 
 def run():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("preview", "watch", "monitor", "launch", "delete-preview", "delete"))
+    parser.add_argument("action", choices=("preview", "watch", "monitor", "launch", "delete-preview", "delete",
+                                           "diagnose", "verify-backup", "recovery-preview", "recover"))
     parser.add_argument("workspaces", type=Path, nargs="+")
     parser.add_argument("--open", choices=("codex", "workbuddy", "both"), dest="open_target",
                         help="open installed apps after a successful monitor or launch cycle")
     parser.add_argument("--compatible-only", action="store_true",
                         help="merge supported text sessions and defer unsupported sessions and their matched copies")
     parser.add_argument("--reviewed", help="exact pair token returned by delete-preview after review")
+    parser.add_argument("--operation", help="unfinished operation ID shown by diagnose")
+    parser.add_argument("--backup", help="workspace backup filename reported by AWB")
+    parser.add_argument("--confirm-recovery", action="store_true")
     args = parser.parse_args()
     if args.open_target and args.action not in ("monitor", "launch"):
         parser.error("--open requires monitor or launch")
@@ -630,6 +753,15 @@ def run():
         parser.error("Deletion requires exactly one workspace")
     if bool(args.reviewed) != (args.action == "delete"):
         parser.error("delete requires a reviewed pair token")
+    if args.action in ("recovery-preview", "recover"):
+        if len(args.workspaces) != 1 or not args.operation:
+            parser.error("Recovery requires one workspace and --operation")
+    elif args.operation:
+        parser.error("--operation requires recovery-preview or recover")
+    if args.confirm_recovery != (args.action == "recover"):
+        parser.error("recover requires --confirm-recovery")
+    if bool(args.backup) != (args.action == "verify-backup") or (args.backup and len(args.workspaces) != 1):
+        parser.error("verify-backup requires one workspace and --backup")
     workspaces = [path.resolve(strict=True) for path in args.workspaces]
     if len(set(workspaces)) != len(workspaces):
         parser.error("list each workspace only once")
@@ -642,7 +774,36 @@ def run():
                       lambda: current_accounts(codex), compatible_only=args.compatible_only)
         for workspace in workspaces
     ]
+    if args.action == "diagnose":
+        for store in stores:
+            store.check_binding()
+            print("WORKSPACE", store.workspace)
+            for report in store.schema_reports():
+                print(report.describe())
+            pending = store.journal.pending()
+            if pending is not None:
+                details = {key: pending[key] for key in ("id", "kind", "state", "completed", "step", "error", "backup")}
+                print("RECOVERY_REQUIRED", json.dumps(details))
+        return
+    if args.action == "recovery-preview":
+        print("RECOVERY_PREVIEW", json.dumps(inspect_recovery(stores[0], args.operation)), flush=True)
+        return
+    if args.action == "verify-backup":
+        stores[0].check_binding()
+        path = backup_path(stores[0], args.backup)
+        print("BACKUP_VERIFIED", path, len(verify(path)), flush=True)
+        return
+    if args.action == "recover":
+        gate = OfflineSync(stores[0], active_clients)
+        lock = scoped_path(controller, controller / "controller.lock")
+        with exclusive_file_lock(lock, "Stop the AWB monitor before recovery"):
+            result = recover(stores[0], args.operation, gate.require_closed)
+        print("RECOVERY_COMPLETE", json.dumps(result), flush=True)
+        return
     if args.action == "delete-preview":
+        pending = stores[0].journal.pending()
+        if pending:
+            raise ValueError("RECOVERY_REQUIRED operation=" + pending["id"])
         stores[0].require_write_schema()
         print("DELETE_CANDIDATES", json.dumps([row for row, _ in stores[0].lifecycle.delete_candidates()]),
               flush=True)
@@ -661,6 +822,9 @@ def run():
                 print("WORKSPACE", store.workspace, flush=True)
             try:
                 store.check_binding()
+                pending = store.journal.pending()
+                if pending:
+                    print("RECOVERY_REQUIRED", pending["id"], pending["kind"], pending["state"], flush=True)
                 reports = store.schema_reports()
                 for report in reports:
                     print(report.describe(), flush=True)
@@ -713,7 +877,7 @@ if __name__ == "__main__":
         run()
     except KeyboardInterrupt:
         print("SYNC_CANCELLED", flush=True)
-    except (RuntimeError, OSError, ValueError, sqlite3.Error, KeyError, ClientActive) as error:
+    except (RuntimeError, OSError, ValueError, sqlite3.Error, KeyError, BadZipFile) as error:
         # Validation errors contain labels/ordinals, never native message content or credentials.
         print("SYNC_STOPPED", str(error), flush=True)
         raise SystemExit(1)

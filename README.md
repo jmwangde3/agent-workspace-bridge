@@ -46,3 +46,19 @@ python -B share_workspace.py --workspace '项目名' --restore-memory '<备份 Z
 显式设置 `AWB_CONFIG` 时，路径和 JSON 必须有效。自检默认写入 `%LOCALAPPDATA%\AWB\diagnostics\awb_selftest.json`，也可用 `--selftest --selftest-output '<文件路径>'` 指定。崩溃日志与 GUI 日志放在 `%LOCALAPPDATA%\AWB\logs`。
 
 记忆 ZIP 的上限为压缩包 512 MiB、10,000 个正文文件、单文件 256 MiB、正文解压总量 2 GiB，manifest 和中央目录各 16 MiB。恢复先核对元数据，再按实际读取字节和摘要验证。完成前只使用标为 `.partial` 的暂存目录。
+
+## 原生同步候选版验收
+
+在控制台用「兼容与恢复诊断」查看结构支持、待恢复操作 ID 和备份位置。已诊断为未知结构或待恢复的工作区会禁用写入入口，处理完后重新诊断。同步命令执行时也会独立检查。
+
+原生同步仍受客户端私有存储结构影响。跨 SQLite 与 JSONL 的操作分步写入并逐步验证。只有现状和原计划能核对时才执行恢复。不要用备份覆盖整库，也不要在存在未完成操作时降级运行旧同步器。
+
+```powershell
+python -B -m unittest discover -s tests -v
+Push-Location experiments/native_session_sync
+python -B -m unittest discover -v
+Pop-Location
+python -B awb_gui.py --selftest
+```
+
+原生测试使用临时会话库及隔离的 Codex CLI。Windows 双客户端实际识别、续聊和恢复仍是候选版稳定发布前的验收项。

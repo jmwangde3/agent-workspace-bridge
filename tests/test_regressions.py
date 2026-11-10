@@ -83,6 +83,18 @@ class MemoryTests(unittest.TestCase):
                 spawn.assert_not_called()
                 app.sync_action("monitor")
                 self.assertEqual(spawn.call_args.args[0][-3:], ["monitor", str(self.root / "w1"), "--compatible-only"])
+                app.sync_action("diagnose")
+                result = run.call_args.kwargs
+                result["private_line"]("WORKSPACE " + str(self.root / "w1"))
+                result["private_line"]('RECOVERY_REQUIRED {"id": "test"}')
+                result["after"]()
+                self.assertTrue(all(button.instate(["disabled"]) for button in app.sync_writes))
+                app.sync_action("diagnose")
+                result = run.call_args.kwargs
+                result["private_line"]("WORKSPACE " + str(self.root / "w1"))
+                result["private_line"]("SCHEMA CODEX READ_WRITE_SUPPORTED")
+                result["after"]()
+                self.assertTrue(all(button.instate(["!disabled"]) for button in app.sync_writes))
 
     def test_memory_backup_preview_recovery_and_merge_preserve_content(self):
         ws = self.root / "w1"

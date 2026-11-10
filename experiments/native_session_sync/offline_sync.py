@@ -6,6 +6,20 @@ class ClientActive(RuntimeError):
     pass
 
 
+def fingerprint_paths(paths):
+    # WAL bytes, the DB and transcript mtimes can change after a GUI window closes.
+    result = []
+    for path in sorted(paths):
+        try:
+            info = path.stat()
+        except FileNotFoundError:
+            continue
+        if path.name.endswith("-wal") and info.st_size == 0:
+            continue
+        result.append((path, info.st_size, info.st_mtime_ns, info.st_dev, info.st_ino))
+    return tuple(result)
+
+
 class OfflineSync:
     def __init__(self, lab, active_clients, settle_seconds=0.75, clock=time.monotonic, pause=time.sleep,
                  backup_before_sync=None):
@@ -33,18 +47,7 @@ class OfflineSync:
             raise ClientActive("Active clients: " + ", ".join(active))
 
     def fingerprint(self):
-        # WAL bytes, the DB and transcript mtimes can still change after a GUI window closes.
-        result = []
-        for path in sorted(self.lab.sync_paths()):
-            try:
-                stat = path.stat()
-            except FileNotFoundError:
-                continue
-            # SQLite may create an empty WAL when a snapshot reader opens the database.
-            if path.name.endswith("-wal") and stat.st_size == 0:
-                continue
-            result.append((path, stat.st_size, stat.st_mtime_ns))
-        return tuple(result)
+        return fingerprint_paths(self.lab.sync_paths())
 
     def tick(self):
         if not self.pending:

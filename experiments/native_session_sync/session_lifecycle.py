@@ -9,7 +9,9 @@ import sqlite3
 import time
 import uuid
 
-from native_sync import AGENTS, Copy, read_messages
+from backup_lab import file_hash
+from native_sync import AGENTS, Copy, digest, read_messages
+from offline_sync import OfflineSync
 
 
 VISIBLE = {"active", "archived"}
@@ -186,41 +188,170 @@ class SessionLifecycle:
         result = {"archive_conflicts": conflicts} if conflicts else {}
         if not actions:
             return result
-        guard()
-        s.verified_backup({}, [path for _, copies, _, _, _ in actions for path in self.paths(copies)])
+        steps = []
+        paths = []
+        for pair, copies, source, state, histories in actions:
+            steps.append({"group": pair[0], "before": self.snapshot(copies), "source": source, "state": state,
+                          "source_history": digest(histories[0]), "target_history": digest(histories[1])})
+            paths.extend(self.paths(copies))
+        result.update(self.run_operation("archive", steps, paths, guard, fingerprint, initial))
+        return result
+
+    @staticmethod
+    def snapshot(copies):
+        return [{"sid": item.sid, "state": item.state, "hash": file_hash(item.path) if item.path else None}
+                for item in copies]
+
+    def check_step(self, kind, step, pair):
+        copies = self.replicas([pair])[pair[0]]
+        actual = self.snapshot(copies)
+        before = step["before"]
+        if [item["sid"] for item in actual] != [item["sid"] for item in before]:
+            raise ValueError("The recorded native session mapping changed")
+        if kind == "delete":
+            expected = [dict(item) for item in before]
+            if before[0]["state"] in VISIBLE:
+                expected[0].update(state="missing", hash=None)
+            if before[1]["state"] in VISIBLE:
+                expected[1]["state"] = "deleted"
+            if any(current not in (old, new) for current, old, new in zip(actual, before, expected)):
+                raise ValueError("A deletion target has unexpected state or changed history")
+            return copies, actual == expected
+
+        source, state = step["source"], step["state"]
+        target = 1 - source
+        if actual[source] != before[source] or copies[target].state not in (before[target]["state"], state):
+            raise ValueError("An archive source or target has unexpected state")
+        changed_history = state == "archived" and step["source_history"] != step["target_history"]
+        desired = step["source_history"] if changed_history else step["target_history"]
+        target_hash = digest(read_messages(copies[target].path, AGENTS[target], copies[target].sid))
+        if target_hash not in (step["target_history"], desired):
+            raise ValueError("An archive target has unexpected history")
+        if target_hash == step["target_history"] and actual[target]["hash"] != before[target]["hash"]:
+            raise ValueError("An archive target transcript changed outside AWB")
+        after = copies[target].state == state and target_hash == desired
+        if copies[target].state == state and not after:
+            raise ValueError("The archive target changed state without the planned history")
+        return copies, after
+
+    def inspected_steps(self, pending, plan):
+        pairs = {pair[0]: pair for pair in self.pairs()}
+        for ordinal, step in enumerate(plan["steps"]):
+            pair = pairs.get(step["group"])
+            if pair is None:
+                raise ValueError("The recorded lifecycle pair is missing")
+            copies, after = self.check_step(pending["kind"], step, pair)
+            if ordinal < pending["completed"] and not after:
+                raise ValueError("A verified lifecycle pair changed after completion")
+            yield step, pair, copies, after
+
+    def inspect_recovery(self, pending, plan):
+        return {"operation": pending["id"], "kind": pending["kind"], "state": pending["state"],
+                "steps": [{"group": pair[0], "state": "after" if after else "replay"}
+                          for _, pair, _, after in self.inspected_steps(pending, plan)]}
+
+    def recover(self, pending, plan, guard, fingerprint, initial):
+        targets = list(self.inspected_steps(pending, plan))
         guard()
         if fingerprint() != initial:
-            raise ValueError("Native session files changed during the archive backup")
-        s.require_write_schema()
-        print("VERIFIED_BACKUP", s.last_backup, flush=True)
-        for pair, copies, source, state, histories in actions:
-            gid, title, history, _, _ = pair
-            target = 1 - source
+            raise ValueError("Native files changed during lifecycle recovery review")
+        try:
+            return self.apply_plan(pending, targets, guard, "RECOVERED")
+        except BaseException as error:
+            self.store.journal.record_failure(pending["id"], error)
+            raise
+
+    def run_operation(self, kind, steps, paths, guard, fingerprint, initial):
+        s = self.store
+        guard()
+        backup = s.backup_destination()
+        with s.journal.operation(kind, initial, backup) as operation:
+            s.checkpoint_backup(operation, {}, paths, backup)
             guard()
-            if (self.replicas([pair])[gid] != copies or self.plan_history(copies, source, history) != histories):
-                raise ValueError("The session changed after the archive backup")
-            item = copies[target]
-            source_history, target_history = histories
-            if state == "archived" and source_history != target_history:
-                current = Copy(item.sid, title, item.path, target_history)
+            if fingerprint() != initial:
+                raise ValueError("Native session files changed during the lifecycle backup")
+            s.require_write_schema()
+            plan = {"steps": steps}
+            pending = {"id": operation, "kind": kind, "completed": 0}
+            targets = list(self.inspected_steps(pending, plan))
+            s.journal.prepare_standalone(operation, plan)
+            print("VERIFIED_BACKUP", s.last_backup, flush=True)
+            return self.apply_plan(pending, targets, guard, "COMMITTED")
+
+    def apply_plan(self, pending, targets, guard, final_state):
+        s = self.store
+        check_db, refresh_db = s.database_fence(guard)
+        operation, kind = pending["id"], pending["kind"]
+        result = {"operation_id": operation}
+        for ordinal, (step, pair, _, _) in enumerate(targets):
+            if ordinal < pending["completed"]:
+                continue
+            check_db()
+            copies, after = self.check_step(kind, step, pair)
+            s.journal.advance(operation, "APPLYING", step=f"{ordinal}:{kind}/{pair[0]}")
+            if kind == "delete":
+                if copies[0].state in VISIBLE:
+                    s.codex_action(copies[0].sid, "delete", check_db)
+                    refresh_db()
+                check_db()
+                copies, _ = self.check_step(kind, step, pair)
+                if copies[1].state in VISIBLE:
+                    self.set_workbuddy(copies[1], "deleted", check_db)
+                    refresh_db()
+            else:
+                extended = self.apply_archive(step, pair, copies, after, check_db, refresh_db)
+                if extended:
+                    result["archive_extended"] = result.get("archive_extended", 0) + 1
+                key = "archived" if step["state"] == "archived" else "unarchived"
+                result[key] = result.get(key, 0) + 1
+            s.journal.advance(operation, "VERIFYING")
+            check_db()
+            _, after = self.check_step(kind, step, pair)
+            if not after:
+                raise ValueError("Lifecycle read-back did not match the original plan")
+            if kind == "archive":
+                source, state = step["source"], step["state"]
+                with closing(sqlite3.connect(s.state)) as db, db:
+                    db.execute("UPDATE lifecycle SET codex=?, workbuddy=? WHERE id=?", (state, state, pair[0]))
+                    if state == "archived":
+                        history = read_messages(copies[source].path, AGENTS[source], copies[source].sid)
+                        db.execute("UPDATE sessions SET history=? WHERE id=?", (json.dumps(history), pair[0]))
+            s.journal.advance(operation, "PREPARED", completed=ordinal + 1)
+        for step, pair, _, _ in targets:
+            if not self.check_step(kind, step, pair)[1]:
+                raise ValueError("A lifecycle target changed after verification")
+        s.verify_integrity()
+        check_db()
+        s.journal.advance(operation, final_state)
+        return result
+
+    def apply_archive(self, step, pair, copies, after, guard, refresh_db):
+        if after:
+            return False
+        s = self.store
+        source, state = step["source"], step["state"]
+        target = 1 - source
+        item = copies[target]
+        extended = False
+        if state == "archived":
+            messages = read_messages(copies[source].path, AGENTS[source], copies[source].sid)
+            old = read_messages(item.path, AGENTS[target], item.sid)
+            if old != messages:
+                current = Copy(item.sid, pair[1], item.path, old)
                 if target == 0:
                     s.codex_template = None
                     s.choose_codex_template({item.sid: current})
-                s.publish(AGENTS[target], item.sid, title, source_history, current)
-                item = self.replicas([pair])[gid][target]
-                result["archive_extended"] = result.get("archive_extended", 0) + 1
-            if target == 0:
-                s.codex_action(item.sid, "archive" if state == "archived" else "unarchive", guard)
-            else:
-                self.set_workbuddy(item, state, guard)
-            guard()
-            with closing(sqlite3.connect(s.state)) as db, db:
-                db.execute("UPDATE lifecycle SET codex=?, workbuddy=? WHERE id=?", (state, state, gid))
-                if state == "archived":
-                    db.execute("UPDATE sessions SET history=? WHERE id=?", (json.dumps(source_history), gid))
-            key = "archived" if state == "archived" else "unarchived"
-            result[key] = result.get(key, 0) + 1
-        return result
+                guard()
+                s.publish(AGENTS[target], item.sid, pair[1], messages, current, before_index=guard)
+                refresh_db()
+                item = self.replicas([pair])[pair[0]][target]
+                extended = True
+        if target == 0:
+            s.codex_action(item.sid, "archive" if state == "archived" else "unarchive", guard)
+        else:
+            self.set_workbuddy(item, state, guard)
+        refresh_db()
+        return extended
 
     @staticmethod
     def review_key(binding, gid, copies):
@@ -253,6 +384,7 @@ class SessionLifecycle:
         with s.sync_lock():
             guard()
             s.require_write_schema()
+            s.journal.require_idle()
 
             def recheck():
                 guard()
@@ -262,11 +394,11 @@ class SessionLifecycle:
                 return result[1]
 
             cx, wb = recheck()
-            s.verified_backup({}, self.paths((cx, wb)))
+            def reviewed_guard():
+                guard()
+                s.check_binding()
+            fingerprint = OfflineSync(s, lambda: ()).fingerprint
+            initial = fingerprint()
             cx, wb = recheck()
-            s.require_write_schema()
-            print("VERIFIED_BACKUP", s.last_backup, flush=True)
-            if cx.state in VISIBLE:
-                s.codex_action(cx.sid, "delete", guard)
-            if wb.state in VISIBLE:
-                self.set_workbuddy(wb, "deleted", guard)
+            steps = [{"group": token.split(":", 1)[0], "before": self.snapshot((cx, wb))}]
+            return self.run_operation("delete", steps, self.paths((cx, wb)), reviewed_guard, fingerprint, initial)

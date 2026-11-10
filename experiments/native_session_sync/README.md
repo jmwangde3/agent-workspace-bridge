@@ -34,7 +34,7 @@ python -B probe_workbuddy.py 'H:/Program Files/WorkBuddy/WorkBuddy.exe' --requir
 
 ## Windows 实机验收
 
-只读预览会报告两个原生库的读写兼容性。识别到必需字段时输出 `READ_SUPPORTED`，已验证的表结构才输出 `WRITE_SUPPORTED`。输出 `UNKNOWN_SCHEMA` 时，AWB 暂停该工作区的原生写入。校验摘要包含表定义、字段、唯一索引和触发器。客户端更新后需重新验证结构与隔离样例才能增加写入白名单。
+只读预览会报告两个原生库的读写兼容性。已验证的结构输出 `READ_WRITE_SUPPORTED`。必需字段可读但结构未知时显示 `READ_ONLY_SUPPORTED UNKNOWN_SCHEMA`，可以扫描会话，原生写入会停止。损坏或不可用的数据库分别显示 `CORRUPT_STORAGE`、`UNAVAILABLE`。摘要包含表定义、字段、唯一索引和触发器。已知表末尾新增的无约束、无默认值可空字段允许通过。客户端更新后的其他结构需先验证再加入白名单。
 
 在两端打开同一个新的本地工作区，分别创建一条已完成的普通文本会话。先预览，确认输出 `CODEX 1` 和 `WORKBUDDY 1`。从独立 PowerShell 启动监听，然后彻底退出两端。WorkBuddy 的关闭按钮可能只隐藏窗口，需从托盘退出。保持 PowerShell 打开，出现 `SYNC_COMPLETE` 后再重开两端检查会话。
 
@@ -63,9 +63,28 @@ python -B workspace_sync.py monitor 'H:\路径\工作区一' --open both
 
 控制台默认使用 `--compatible-only`。第一次运行会登记已配对会话两端的归档状态。以后观察到一端归档或取消归档时，会同步状态。如果只有发起端新增了可同步的续写，归档前会先补到另一端。日志的 `archived` 和 `unarchived` 统计本轮应用的状态变化。若另一端有不同的续写或历史无法安全核对，则保留两份，在 `archive_conflicts` 中计数。想继续合并正文，可以先把两端恢复为正常状态。
 
-要从两端移除同一会话，停止常驻监控，退出 Codex、WorkBuddy 和可能运行的 WorkDaddy 守护进程。在控制台选一个工作区，点「删除两端副本」，核对会话与两端状态后确认。确认失效时重新预览。AWB 验证备份后先调用 Codex 原生删除，再把 WorkBuddy 副本移入回收站。如果执行到一半失败，按日志找到首次备份，再预览并确认剩余副本。自动同步遇到一端缺失或已删除时只暂缓该组。
+要从两端移除同一会话，停止常驻监控，退出 Codex、WorkBuddy 和可能运行的 WorkDaddy 守护进程。在控制台选一个工作区，点「删除两端副本」，核对会话与两端状态后确认。确认失效时重新预览。AWB 验证备份后先调用 Codex 原生删除，再把 WorkBuddy 副本移入回收站。部分删除后使用下方的恢复命令核对原计划。自动同步遇到一端缺失或已删除时只暂缓该组。
 
 归档及删除通过本机 Codex CLI 的原生接口和 WorkBuddy 本地会话库执行，不调用模型。备份包含涉及的消息文件、原生索引和数据库，以及配对台账。备份文件保留本地。
+
+## 诊断与恢复
+
+操作台账保存在工作区的同步状态 SQLite 中。操作进入 `PLANNED` 后会记录备份位置，校验完成后记录其摘要。进入 `PREPARED` 时，原始映射、目标 ID、前后摘要和计划摘要会一起提交。每个写入步骤及读回验证都有持久化检查点。台账用现有会话台账中的历史重放，不另存一份消息正文或登录数据。
+
+```powershell
+python -B workspace_sync.py diagnose 'H:\路径\工作区'
+python -B workspace_sync.py verify-backup 'H:\路径\工作区' --backup 'before-日期时间.zip'
+python -B workspace_sync.py recovery-preview 'H:\路径\工作区' --operation '<操作 ID>'
+python -B workspace_sync.py recover 'H:\路径\工作区' --operation '<操作 ID>' --confirm-recovery
+```
+
+1. 出现 `RECOVERY_REQUIRED` 时记录操作 ID。预览只读，会核对备份、计划和两端现状。
+2. 确认是原操作留下的部分写入后，停止监控、退出两端，再明确执行恢复。若只完成了部分投影，会继续使用原计划的目标 ID 和消息顺序。
+3. 记录尚未进入准备阶段时，下一轮可安全结束该记录。若内容、账号、备份或结构不符，AWB 会保留现场并停止。应先保留数据库、会话文件、台账和备份，再核对冲突。
+
+新写入完成后会读回本地数据库和消息顺序，并运行 SQLite 完整性检查。SQLite 与 JSONL 是分步写入的。恢复依赖原计划和经校验的备份，直接覆盖整库可能抹掉备份之后的修改。窗口打开并实际识别会话属于单独的实机验收。Windows 进程检查与文件指纹可检测大部分并发改动，客户端没有协作锁时仍应保持完全退出。
+
+候选版的 Codex 隔离测试使用 CLI 0.167.0-alpha.3.2。WorkBuddy 5.9.3.0 用于本机结构核对，写入测试使用临时 SQLite 和 JSONL。当前结构指纹见 `storage_schema.py`。两端真实窗口续聊及故障恢复仍需用隔离账号或隔离 HOME 验收。
 
 ## 模型上下文验证
 
