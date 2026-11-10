@@ -16,6 +16,7 @@ RUNTIME = (
     'experiments/native_session_sync/native_sync.py', 'experiments/native_session_sync/offline_sync.py',
     'experiments/native_session_sync/codex_rollout.py', 'experiments/native_session_sync/backup_lab.py',
     'experiments/native_session_sync/session_lifecycle.py', 'experiments/native_session_sync/probe_codex.py',
+    'experiments/native_session_sync/storage_schema.py',
 )
 
 

@@ -1,6 +1,7 @@
 """Exercise the opt-in gate with native file layouts in a private test directory."""
 
 from contextlib import closing, redirect_stdout
+from dataclasses import replace
 from io import StringIO
 import json
 import os
@@ -52,6 +53,33 @@ class WorkspaceGateCases(unittest.TestCase):
         self.accounts = ("test-codex-account", OWNER)
         self.store = WorkspaceSync(self.lab.workspace, self.lab.codex, self.lab.workbuddy,
                                    Path(temp.name) / "state", lambda: self.accounts)
+        self.store.schemas = tuple(replace(schema, write_fingerprints=frozenset({report.fingerprint}))
+                                   for schema, report in zip(self.store.schemas, self.store.schema_reports()))
+
+    def test_unknown_readable_schema_blocks_first_write(self):
+        with closing(sqlite3.connect(self.store.wb_db)) as db, db:
+            db.execute("ALTER TABLE sessions ADD COLUMN unknown_metadata TEXT")
+        original = {path: path.read_bytes() for path in (self.store.wb_db, self.store.codex_db, self.a_path)}
+        report = self.store.schema_reports()[1]
+        self.assertFalse(report.invalid_columns)
+        self.assertFalse(report.write_supported)
+        self.assertIn("READ_SUPPORTED UNKNOWN_SCHEMA", report.describe())
+        with self.assertRaisesRegex(ValueError, "UNKNOWN_SCHEMA"):
+            self.store.sync(lambda: None)
+        self.assertFalse(self.store.state.exists())
+        for path, expected in original.items():
+            self.assertEqual(path.read_bytes(), expected)
+
+    def test_mistyped_or_missing_columns_block_even_read_validation(self):
+        with closing(sqlite3.connect(self.store.wb_db)) as db, db:
+            db.execute("ALTER TABLE sessions RENAME COLUMN transport TO unsupported_transport")
+            db.execute("ALTER TABLE sessions RENAME COLUMN deleted_at TO old_deleted_at")
+            db.execute("ALTER TABLE sessions ADD COLUMN deleted_at TEXT")
+        report = self.store.schema_reports()[1]
+        self.assertIn("transport", report.invalid_columns)
+        self.assertIn("deleted_at", report.invalid_columns)
+        with self.assertRaisesRegex(ValueError, "READ_UNSUPPORTED"):
+            self.store.schemas[1].validate_read(report)
 
     def test_desktop_page_context_is_skipped_but_tool_results_are_blocked(self):
         path = cx.create(self.lab.codex, "44444444-4444-4444-8444-444444444444", self.lab.workspace,
@@ -216,6 +244,7 @@ class WorkspaceGateCases(unittest.TestCase):
     def test_batch_isolates_blocked_workspace_and_gates_launch(self):
         other = WorkspaceSync(self.outside, self.lab.codex, self.lab.workbuddy,
                               self.store.root.with_name("outside-state"), lambda: self.accounts)
+        other.schemas = self.store.schemas
         batch = WorkspaceBatch([self.store, other])
         clock = Clock()
         gate = OfflineSync(batch, lambda: (), 0, clock, clock.sleep)

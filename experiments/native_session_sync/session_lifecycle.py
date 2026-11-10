@@ -191,6 +191,7 @@ class SessionLifecycle:
         guard()
         if fingerprint() != initial:
             raise ValueError("Native session files changed during the archive backup")
+        s.require_write_schema()
         print("VERIFIED_BACKUP", s.last_backup, flush=True)
         for pair, copies, source, state, histories in actions:
             gid, title, history, _, _ = pair
@@ -250,6 +251,9 @@ class SessionLifecycle:
     def delete(self, token, guard):
         s = self.store
         with s.sync_lock():
+            guard()
+            s.require_write_schema()
+
             def recheck():
                 guard()
                 result = next(self.delete_candidates(token.split(":", 1)[0]), None)
@@ -260,6 +264,7 @@ class SessionLifecycle:
             cx, wb = recheck()
             s.verified_backup({}, self.paths((cx, wb)))
             cx, wb = recheck()
+            s.require_write_schema()
             print("VERIFIED_BACKUP", s.last_backup, flush=True)
             if cx.state in VISIBLE:
                 s.codex_action(cx.sid, "delete", guard)

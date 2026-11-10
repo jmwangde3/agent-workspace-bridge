@@ -34,6 +34,8 @@ python -B probe_workbuddy.py 'H:/Program Files/WorkBuddy/WorkBuddy.exe' --requir
 
 ## Windows 实机验收
 
+只读预览会报告两个原生库的读写兼容性。识别到必需字段时输出 `READ_SUPPORTED`，已验证的表结构才输出 `WRITE_SUPPORTED`。输出 `UNKNOWN_SCHEMA` 时，AWB 暂停该工作区的原生写入。校验摘要包含表定义、字段、唯一索引和触发器。客户端更新后需重新验证结构与隔离样例才能增加写入白名单。
+
 在两端打开同一个新的本地工作区，分别创建一条已完成的普通文本会话。先预览，确认输出 `CODEX 1` 和 `WORKBUDDY 1`。从独立 PowerShell 启动监听，然后彻底退出两端。WorkBuddy 的关闭按钮可能只隐藏窗口，需从托盘退出。保持 PowerShell 打开，出现 `SYNC_COMPLETE` 后再重开两端检查会话。
 
 ```powershell

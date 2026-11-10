@@ -20,6 +20,7 @@ from native_sync import AGENTS, Copy, Lab, atomic_text, create_ledger, exclusive
 from offline_sync import ClientActive, OfflineSync
 from probe_codex import Codex
 from session_lifecycle import SessionLifecycle
+from storage_schema import CODEX_SCHEMA, WORKBUDDY_SCHEMA
 
 
 PROCESS_CHECK = r"""
@@ -111,6 +112,14 @@ class WorkspaceSync(Lab):
         self.codex_anchors = {}
         self.client_check = client_check
         self.lifecycle = SessionLifecycle(self, read_db, same_workspace, native_path)
+        self.schemas = (CODEX_SCHEMA, WORKBUDDY_SCHEMA)
+
+    def schema_reports(self):
+        return [schema.detect_version(path) for schema, path in zip(self.schemas, (self.codex_db, self.wb_db))]
+
+    def require_write_schema(self):
+        for schema, report in zip(self.schemas, self.schema_reports()):
+            schema.validate_write(report)
 
     def local(self, *parts):
         base = self.root
@@ -436,6 +445,7 @@ class WorkspaceSync(Lab):
                 self.check_binding()
 
             guard()
+            self.require_write_schema()
             marker = self.local("scope.json")
             if not marker.exists():
                 atomic_text(marker, json.dumps(self.binding))
@@ -471,6 +481,7 @@ class WorkspaceSync(Lab):
             guard()
             if gate.fingerprint() != initial:
                 raise ClientActive("Native files changed during the backup")
+            self.require_write_schema()
             self.codex_indexed = 0
             result = self._sync(guard, native, deferred_groups, deferred)
             if self.compatible_only:
@@ -632,6 +643,7 @@ def run():
         for workspace in workspaces
     ]
     if args.action == "delete-preview":
+        stores[0].require_write_schema()
         print("DELETE_CANDIDATES", json.dumps([row for row, _ in stores[0].lifecycle.delete_candidates()]),
               flush=True)
         return
@@ -649,8 +661,13 @@ def run():
                 print("WORKSPACE", store.workspace, flush=True)
             try:
                 store.check_binding()
+                reports = store.schema_reports()
+                for report in reports:
+                    print(report.describe(), flush=True)
+                for schema, report in zip(store.schemas, reports):
+                    schema.validate_read(report)
                 native, groups, deferred = store.selection()
-                if store.compatible_only and any(native.values()):
+                if store.compatible_only and any(native.values()) and all(report.write_supported for report in reports):
                     store.choose_codex_template(native["codex"])
             except (ValueError, FileNotFoundError) as error:
                 if len(stores) == 1:
