@@ -7,19 +7,14 @@
 """
 import os
 import json
+import sys
 
-HERE = os.path.dirname(os.path.abspath(__file__))
+HERE = os.path.dirname(sys.executable if getattr(sys, "frozen", False) else os.path.abspath(__file__))
 
 DEFAULTS = {
     "workspace_root": "~/workspaces",
     "config_dir": "configs",
-    "skills_vault": "~/.workbuddy/skills-vault",
-    "skills_user": "~/.workbuddy/skills",
-    "skills_real": "~/.agent_skills/skills",
     "snippet": "~/.workbuddy/agent-memory-snippet.md",
-    "skills_workspaces": "<config_dir>/skills-workspaces.json",
-    "skills_matrix": "<config_dir>/skills-matrix.json",
-    "agent_skill_paths": "<config_dir>/agent-skill-paths.json",
 }
 
 
@@ -33,17 +28,13 @@ def _abs(value, raw):
     return os.path.normpath(value)
 
 
-def _posix(win_path):
-    drive, rest = os.path.splitdrive(win_path)
-    return "/" + drive.rstrip(":").lower() + rest.replace("\\", "/")
-
 
 def load():
     src = os.environ.get("AWB_CONFIG") or os.path.join(HERE, "config.json")
     raw = dict(DEFAULTS)
     if os.path.isfile(src):
         with open(src, encoding="utf-8") as f:
-            raw.update(json.load(f))
+            raw.update({key: value for key, value in json.load(f).items() if key in DEFAULTS})
     raw["config_dir"] = _abs(raw["config_dir"], raw)
     return {k: _abs(v, raw) for k, v in raw.items()}
 
@@ -51,11 +42,11 @@ def load():
 C = load()
 WORKSPACE_ROOT = C["workspace_root"]
 CONFIG_DIR = C["config_dir"]
-VAULT = C["skills_vault"]
-USER = C["skills_user"]
-REAL = C["skills_real"]
 SNIPPET = C["snippet"]
-CFG = C["skills_workspaces"]
-MATRIX = C["skills_matrix"]
-AGENT_PATHS = C["agent_skill_paths"]
-POSIX_REAL = _posix(REAL)
+
+
+def list_workspaces():
+    if not os.path.isdir(WORKSPACE_ROOT):
+        return []
+    return sorted(name for name in os.listdir(WORKSPACE_ROOT)
+                  if not name.startswith(".") and os.path.isdir(os.path.join(WORKSPACE_ROOT, name)))

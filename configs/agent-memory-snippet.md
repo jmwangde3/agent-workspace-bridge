@@ -20,19 +20,10 @@
 - 本块由 `sync-agent-memory.ps1 -Update` 同步到各客户端规则文件，别手改各通道副本。
 <!-- /memory-routing -->
 
-<!-- skills-scope -->
-## 技能作用域（按工作空间）
-- 宿主扫描顺序 workspace `{cwd}/.codebuddy/skills/` → user `~/.workbuddy/skills/` → connector → builtin，按技能名去重、先扫优先。
-- 全局级技能放用户级 skills 目录，所有工作空间可见；工作空间专属只放 `<WORKSPACES>/<workspace>/.codebuddy/skills/`，cwd 不同 → 各工作空间天然互相看不到对方的专属技能。
-- 分配表 `<AWB_ROOT>/skills-workspaces.json`：global 列表 + bundles + rules（第一条命中生效，未命中者只有全局）。改分类只改这个 JSON，再跑 `python scope_skills.py --apply`。
-- 全量技能链接保管在保管库目录（宿主不扫描）；`--status` 查看各工作空间清单，`--user-restore` 取消隔离。
-<!-- /skills-scope -->
-
 <!-- shared-workspace -->
 ## 共享工作空间（多客户端落盘即见）
 - 各客户端的同一逻辑工作空间指向同一物理目录，无需跨目录同步。
-- canonical 层 `<workspace>/.shared/skills/` 放工作空间专属技能实体，`<workspace>/.shared/memory/` 放 MEMORY.md 索引与 YYYY-MM-DD.md append-only 日记。
-- 各客户端项目级 skills 目录与会话记忆目录做成链接指向 canonical；一处增删，落盘后所有客户端立即可见，不要求同时协同。目录链接用 Junction（Windows，`mklink /J`）或 symlink（类 Unix）。
+- 共享记忆位于 `<workspace>/.shared/memory/`，WorkBuddy 的 `.workbuddy/memory` 链接到该目录。
 - 记忆写回统一到工作空间 `AGENTS.md` 指定的唯一同步点与 `.shared/memory/`；各客户端私有会话记忆不并入。
 - 入口文件保持 thin shim：其他客户端的规则文件只放一行指向 `AGENTS.md` 的指针，不复制协议正文。
 - 记忆新鲜度：canonical 记忆是摘要与导航层；改代码/规划/报状态前先核活文件与 git，记忆与现实冲突时以活工作空间为准并回写修正。

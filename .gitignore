@@ -13,3 +13,7 @@ venv/
 dist/
 build/
 *.spec
+
+_test_runs/
+backups/
+awb_selftest.json

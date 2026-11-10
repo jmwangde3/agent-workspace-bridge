@@ -1,276 +1,82 @@
-# -*- coding: utf-8 -*-
-"""共享工作空间：让多个 agent 在同一物理目录里共享记忆与技能。
-
-各 agent 的同一逻辑工作空间本来就指向同一物理目录
-（Codex config.toml: projectlessWorkspaceRoot = 'H:\\AI工作区'；
- 会话记录里 example-game 的 cwd 就是 H:\\AI工作区\\example-game）。
-所以不需要跨目录同步，只要把「实体」收拢到一处、各 agent 约定目录做成
-Junction 指过去，落盘后所有 agent 立刻可见 —— 无实时协同、无轮询。
-
-    <workspace>/.shared/skills/    工作空间专属技能实体（链接指向 ~/.agent_skills/skills）
-    <workspace>/.shared/memory/    MEMORY.md 索引 + YYYY-MM-DD.md append-only 日记
-    <workspace>/.codebuddy/skills ┐
-    <workspace>/.workbuddy/skills │
-    <workspace>/.agents/skills    │ 全部 Junction → .shared/skills
-    <workspace>/.codex/skills     │
-    <workspace>/.claude/skills    │
-    <workspace>/.qoder/skills     │
-    <workspace>/.trae/skills     ┘
-    <workspace>/.workbuddy/memory → Junction → .shared/memory
-
-技能集合的单一事实源仍是 skills-workspaces.json；改完分类跑
-`python scope_skills.py --apply` 会重写 .shared/skills 的内容。
-
-用法：
-    python share_workspace.py --workspace example-game          # 建/刷新共享层
-    python share_workspace.py --all                     # 所有有专属技能的工作空间
-    python share_workspace.py --status example-game             # 只读查看
-    python share_workspace.py --probe example-game              # 落盘即见验证（建临时探针再删）
-"""
-import os
-import re
-import sys
-import json
-import shutil
+"""Manage the shared workspace memory directory and its WorkBuddy link."""
 import argparse
-import subprocess
 import datetime
+import filecmp
+import json
+import os
+import shutil
+import sys
+import uuid
 
-from awb_config import WORKSPACE_ROOT as ROOT, CFG, REAL, MATRIX
-import awb_matrix as M
-REPARSE_POINT = 0x400
+import awb_config as C
+import awb_links as L
 
-AGENT_SKILL_DIRS = [
-    ".codebuddy/skills", ".workbuddy/skills", ".agents/skills",
-    ".codex/skills", ".claude/skills", ".qoder/skills", ".trae/skills",
-]
-
-
-def load_cfg():
-    with open(CFG, encoding="utf-8") as f:
-        return json.load(f)
+MEMORY = ".shared/memory"
+ALIAS = ".workbuddy/memory"
 
 
-def vault_names():
-    v = os.path.join(os.path.expanduser("~"), ".workbuddy", "skills-vault")
-    return sorted(n for n in os.listdir(v) if not n.startswith(".")) if os.path.isdir(v) else []
-
-
-def bundles_for(name, cfg):
-    """委托矩阵层：界面勾选的矩阵存在时为准，否则回退到 rules/bundles。"""
-    return M.bundles_for(name, cfg)[0]
-
-
-def ws_names(name, cfg):
-    pool = vault_names()
-    return [n for n in bundles_for(name, cfg) if n in pool]
-
-
-def is_reparse(p):
-    if os.path.islink(p):
-        return True
-    try:
-        return bool(getattr(os.lstat(p), "st_file_attributes", 0) & REPARSE_POINT)
-    except OSError:
-        return False
-
-
-def rm_entry(p):
-    """删除链接/Junction（只删链接本身，不碰目标）；真实文件/目录不删。"""
-    if not os.path.lexists(p):
-        return
-    if os.path.islink(p):
-        os.unlink(p)
-    elif is_reparse(p):
-        os.rmdir(p)
-    elif os.path.isdir(p):
-        for n in os.listdir(p):
-            q = os.path.join(p, n)
-            if os.path.islink(q) or is_reparse(q):
-                rm_entry(q)
-        if not os.listdir(p):
-            os.rmdir(p)
-    else:
-        os.unlink(p)
+def is_reparse(path):
+    return L.is_link(path)
 
 
 def mk_junction(link, target):
-    os.makedirs(os.path.dirname(link), exist_ok=True)
-    if os.path.lexists(link):
-        rm_entry(link)
-    try:
-        os.symlink(target, link, target_is_directory=True)
-        return link
-    except OSError:
-        pass
-    r = subprocess.run(["cmd", "/c", "mklink", "/J", link, target],
-                       capture_output=True, text=True, encoding="gbk", errors="replace")
-    if r.returncode != 0:
-        raise RuntimeError("link failed: %s %s" % (r.returncode, (r.stdout + r.stderr).strip()[:200]))
-    return link
+    L.ensure_link(target, link)
 
 
-def make_skill_link(name, dst):
-    out = os.path.join(dst, name)
-    if os.path.lexists(out):
-        return
-    try:
-        os.symlink(os.path.join(REAL, name), out, target_is_directory=True)
-    except OSError:
-        r = subprocess.run(["cmd", "/c", "mklink", "/J", out, os.path.join(REAL, name)],
-                           capture_output=True, text=True, encoding="gbk", errors="replace")
-        if r.returncode != 0:
-            print("  FAILED", name, (r.stdout + r.stderr).strip()[:160])
-
-
-def ensure_canonical(ws, names):
-    shared = os.path.join(ws, ".shared")
-    skills = os.path.join(shared, "skills")
-    memory = os.path.join(shared, "memory")
-    os.makedirs(skills, exist_ok=True)
-    os.makedirs(memory, exist_ok=True)
-
-    # 技能实体：按分配表重建（canonical 是唯一实体）
-    keep = set(names)
-    for n in os.listdir(skills):
-        if n not in keep:
-            rm_entry(os.path.join(skills, n))
-    for n in names:
-        make_skill_link(n, skills)
-    print("  canonical skills :", len(names), "->", skills)
-
-    # 记忆骨架
-    idx = os.path.join(memory, "MEMORY.md")
-    if not os.path.exists(idx):
-        with open(idx, "w", encoding="utf-8") as f:
-            f.write(GEN_HEADER + "# %s 工作空间共享记忆（索引卡）\n\n"
-                    "> 只记现行状态 + 回查锚点。append-only 日记在 YYYY-MM-DD.md。\n"
-                    "> 跨客户端唯一同步点仍以本工作空间 AGENTS.md 指向的文件为准（example-game = PROGRESS.md）。\n\n"
-                    "## 现行\n- 待补\n\n## 回查\n- 见本工作空间 AGENTS.md → INDEX.md → 分册\n" % os.path.basename(ws))
-    today = datetime.date.today().isoformat() + ".md"
-    day = os.path.join(memory, today)
+def memory_skeleton(ws, memory):
+    index = os.path.join(memory, "MEMORY.md")
+    if not os.path.exists(index):
+        with open(index, "w", encoding="utf-8") as handle:
+            handle.write("# %s shared memory\n\n## Current\n\n## References\n" % os.path.basename(ws))
+    day = os.path.join(memory, datetime.date.today().isoformat() + ".md")
     if not os.path.exists(day):
-        with open(day, "w", encoding="utf-8") as f:
-            f.write(GEN_HEADER + "# %s\n\n" % datetime.date.today().isoformat())
-    print("  canonical memory :", memory)
-    return shared, skills, memory
+        with open(day, "w", encoding="utf-8") as handle:
+            handle.write("# %s\n\n" % datetime.date.today().isoformat())
+
+
+def merge_memory(source, target):
+    """Copy and verify all regular content; retain both sides of conflicts."""
+    os.makedirs(target, exist_ok=True)
+    for name in os.listdir(source):
+        src, dst = os.path.join(source, name), os.path.join(target, name)
+        if L.is_link(src) or L.is_link(dst):
+            raise ValueError("Memory contains a link; preserved for manual review: " + src)
+        if os.path.isdir(src):
+            if os.path.exists(dst) and not os.path.isdir(dst):
+                dst += ".imported-" + uuid.uuid4().hex[:8]
+                print("MEMORY_CONFLICT:", src, "->", dst)
+            merge_memory(src, dst)
+        elif os.path.isfile(src):
+            if os.path.exists(dst):
+                if os.path.isfile(dst) and filecmp.cmp(src, dst, shallow=False):
+                    continue
+                dst += ".imported-" + uuid.uuid4().hex[:8]
+                print("MEMORY_CONFLICT:", src, "->", dst)
+            shutil.copy2(src, dst)
+            if not filecmp.cmp(src, dst, shallow=False):
+                raise OSError("Memory copy verification failed: " + src)
 
 
 def convert_dir(ws, rel, target):
-    p = os.path.join(ws, *rel.split("/"))
-    if is_reparse(p):
-        # 已是 Junction：内容天然共享，保留
-        print("  %-24s junction (ok)" % rel)
+    p = L.child_path(ws, rel)
+    if L.is_link(p):
+        changed = L.ensure_link(target, p)
+        print(rel, "repaired" if changed else "unchanged")
         return
-    if os.path.isdir(p):
-        # 普通目录：把里面已有的链接清掉（实体已在 canonical），真实文件保留为备份
-        leftovers = [n for n in os.listdir(p) if not (os.path.islink(os.path.join(p, n)) or is_reparse(os.path.join(p, n)))]
-        if leftovers:
-            bak = p + ".bak-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-            shutil.move(p, bak)
-            print("  %-24s backed up -> %s" % (rel, os.path.basename(bak)))
-        else:
-            for n in os.listdir(p):
-                rm_entry(os.path.join(p, n))
-            os.rmdir(p)
-    mk_junction(p, target)
-    print("  %-24s -> junction" % rel)
-
-
-def build(ws, cfg):
-    name = os.path.basename(ws)
-    names = ws_names(name, cfg)
-    print("[%s] dedicated skills: %s" % (name, names))
-    shared, skills, memory = ensure_canonical(ws, names)
-    for rel in AGENT_SKILL_DIRS:
-        convert_dir(ws, rel, skills)
-    # WorkBuddy 的会话记忆目录也接到 canonical
-    wb_mem = os.path.join(ws, ".workbuddy", "memory")
-    if os.path.isdir(wb_mem) and not is_reparse(wb_mem):
-        for n in os.listdir(wb_mem):
-            src, dst = os.path.join(wb_mem, n), os.path.join(memory, n)
-            if not os.path.exists(dst) and os.path.isfile(src):
-                shutil.copy2(src, dst)
-        bak = wb_mem + ".bak-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        shutil.move(wb_mem, bak)
-        print("  .workbuddy/memory  backed up ->", os.path.basename(bak))
-    mk_junction(wb_mem, memory)
-    print("  .workbuddy/memory  -> junction")
-    return shared
-
-
-def status(ws):
-    print("=== workspace:", ws, "===")
-    for rel in [".shared/skills", ".shared/memory"] + AGENT_SKILL_DIRS + [".workbuddy/memory"]:
-        p = os.path.join(ws, *rel.split("/"))
-        if not os.path.lexists(p):
-            print(" %-24s (missing)" % rel)
-            continue
-        if is_reparse(p):
-            try:
-                tgt = os.readlink(p)
-            except OSError:
-                tgt = "(junction)"
-            print(" %-24s JUNCTION -> %s" % (rel, tgt))
-        else:
-            print(" %-24s dir (%d items)" % (rel, len(os.listdir(p))))
-
-
-def probe(ws):
-    """在 canonical 写探针，从各 agent 目录读，证明落盘即见。"""
-    ok = []
-    f = os.path.join(ws, ".shared", "skills", "_share_probe.txt")
-    with open(f, "w", encoding="utf-8") as h:
-        h.write("share-workspace probe\n")
-    for rel in AGENT_SKILL_DIRS:
-        ok.append((rel, os.path.isfile(os.path.join(ws, *rel.split("/"), "_share_probe.txt"))))
-    os.remove(f)
-
-    m = os.path.join(ws, ".shared", "memory", "_share_probe.txt")
-    with open(m, "w", encoding="utf-8") as h:
-        h.write("share-workspace probe\n")
-    ok.append((".workbuddy/memory", os.path.isfile(os.path.join(ws, ".workbuddy", "memory", "_share_probe.txt"))))
-    os.remove(m)
-
-    for rel, hit in ok:
-        print(" %-24s sees probe = %s" % (rel, hit))
-    print("probes removed; all agent paths resolve to the same canonical inode")
-
-
-GEN_HEADER = "<!-- GENERATED by share_workspace.py — 实体在 .shared/；改技能分类请改 skills-workspaces.json 后跑 scope_skills.py --apply -->\n\n"
-
-
-def check(ws, cfg):
-    """漂移检查（CI gate）：所有 agent 路径必须是 Junction 且指向同一 canonical，技能集合与分配表一致。"""
-    problems = []
-    name = os.path.basename(ws)
-    skills = os.path.join(ws, ".shared", "skills")
-    memory = os.path.join(ws, ".shared", "memory")
-    if not os.path.isdir(skills):
-        problems.append("missing .shared/skills")
-    if not os.path.isdir(memory):
-        problems.append("missing .shared/memory")
-    for rel in AGENT_SKILL_DIRS:
-        p = os.path.join(ws, *rel.split("/"))
-        if not is_reparse(p):
-            problems.append("%s is not a junction" % rel)
-        elif os.path.normcase(os.path.realpath(p)) != os.path.normcase(os.path.realpath(skills)):
-            problems.append("%s -> wrong target %s" % (rel, os.path.realpath(p)))
-    if not is_reparse(os.path.join(ws, ".workbuddy", "memory")):
-        problems.append(".workbuddy/memory is not a junction")
-    want = set(ws_names(name, cfg))
-    got = set(n for n in os.listdir(skills) if not n.startswith("_")) if os.path.isdir(skills) else set()
-    if want != got:
-        problems.append("skill set drift: want=%s got=%s" % (sorted(want), sorted(got)))
-    for f in ("MEMORY.md",):
-        if not os.path.isfile(os.path.join(memory, f)):
-            problems.append("missing .shared/memory/" + f)
-    print("[%s] CHECK: %d problems" % (name, len(problems)))
-    for p in problems:
-        print("  FAIL", p)
-    if not problems:
-        print("  OK - all agent paths resolve to canonical, skill set matches spec")
-    return len(problems)
+    if os.path.exists(p):
+        if not os.path.isdir(p):
+            raise ValueError("Real file blocks agent directory: " + p)
+        backup = p + ".bak-" + datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+        os.rename(p, backup)
+        try:
+            mk_junction(p, target)
+        except Exception:
+            if not os.path.lexists(p):
+                os.rename(backup, p)
+            raise
+        print(rel, "backed up ->", backup)
+    else:
+        mk_junction(p, target)
 
 
 def why(ws, rel):
@@ -289,93 +95,114 @@ def why(ws, rel):
         print(rel, "-> real directory (not shared)")
 
 
+def build(ws):
+    memory = L.child_path(ws, MEMORY)
+    if not L.within(memory, ws):
+        raise ValueError("Canonical memory escapes the workspace")
+    alias = L.child_path(ws, ALIAS)
+    os.makedirs(memory, exist_ok=True)
+    if os.path.isdir(alias) and not L.is_link(alias):
+        merge_memory(alias, memory)
+    memory_skeleton(ws, memory)
+    convert_dir(ws, ALIAS, memory)
+
+
+def status(ws):
+    print("WORKSPACE", ws)
+    for relative in (MEMORY, ALIAS):
+        why(ws, relative)
+
+
+def check(ws):
+    memory = L.child_path(ws, MEMORY)
+    alias = L.child_path(ws, ALIAS)
+    ok = (L.within(memory, ws) and os.path.isfile(os.path.join(memory, "MEMORY.md"))
+          and L.is_link(alias) and L.same_target(alias, memory))
+    print("MEMORY_CHECK", "OK" if ok else "FAILED", ws)
+    return 0 if ok else 1
+
+
+def probe(ws):
+    if check(ws):
+        return 1
+    name = "_share_probe_" + uuid.uuid4().hex + ".txt"
+    path = os.path.join(ws, MEMORY, name)
+    with open(path, "x", encoding="utf-8") as handle:
+        handle.write(name)
+    try:
+        hit = L.same_target(os.path.join(ws, ALIAS, name), path)
+        print("MEMORY_PROBE", "OK" if hit else "FAILED")
+        return 0 if hit else 1
+    finally:
+        os.remove(path)
+
+
 def snapshot(ws):
-    """把当前共享层清单写成快照，供差异对照。"""
-    ts = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-    skills = os.path.join(ws, ".shared", "skills")
-    memory = os.path.join(ws, ".shared", "memory")
-    data = {
-        "at": ts,
-        "workspace": os.path.basename(ws),
-        "skills": sorted(n for n in os.listdir(skills) if not n.startswith("_")) if os.path.isdir(skills) else [],
-        "memory_files": sorted(os.listdir(memory)) if os.path.isdir(memory) else [],
-        "agent_dirs": {r: is_reparse(os.path.join(ws, *r.split("/"))) for r in AGENT_SKILL_DIRS},
-    }
-    out = os.path.join(ws, ".shared", "snapshot-%s.json" % ts)
-    with open(out, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-        f.write("\n")
-    print("snapshot ->", out)
+    folder = L.child_path(ws, ".shared")
+    memory = L.child_path(ws, MEMORY)
+    if not L.within(folder, ws) or not L.within(memory, ws):
+        raise ValueError("Shared memory escapes workspace")
+    now = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")
+    files = sorted(os.listdir(memory)) if os.path.isdir(memory) else []
+    path = os.path.join(folder, "snapshot-" + now + ".json")
+    with open(path, "x", encoding="utf-8") as handle:
+        json.dump({"workspace": os.path.basename(ws), "memory_files": files}, handle, ensure_ascii=False, indent=2)
+        handle.write("\n")
+    print("SNAPSHOT", path)
 
 
-def restore(ws, snap, cfg):
-    """按快照报告差异并重建链接结构（不删除任何实体文件）。"""
-    with open(snap, encoding="utf-8") as f:
-        old = json.load(f)
-    skills = os.path.join(ws, ".shared", "skills")
-    now = sorted(n for n in os.listdir(skills) if not n.startswith("_")) if os.path.isdir(skills) else []
-    print("snapshot skills :", old.get("skills"))
-    print("current  skills :", now)
-    added = sorted(set(now) - set(old.get("skills") or []))
-    removed = sorted(set(old.get("skills") or []) - set(now))
-    print("added =", added, "| removed =", removed)
-    build(ws, cfg)
-    print("link structure rebuilt; entity files kept")
+def restore(ws, path):
+    with open(path, encoding="utf-8") as handle:
+        old = json.load(handle)
+    if not isinstance(old, dict) or old.get("workspace") != os.path.basename(ws):
+        raise ValueError("The snapshot belongs to another workspace")
+    print("SNAPSHOT_MEMORY_FILES", old.get("memory_files", []))
+    build(ws)
+    print("MEMORY_LINK_REBUILT")
 
 
 def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--workspace")
-    ap.add_argument("--all", action="store_true")
-    ap.add_argument("--status", action="store_true")
-    ap.add_argument("--probe", action="store_true")
-    ap.add_argument("--check", action="store_true")
-    ap.add_argument("--why", help="agent relative path, e.g. .codex/skills")
-    ap.add_argument("--snapshot", action="store_true")
-    ap.add_argument("--restore", help="path to a snapshot-*.json")
-    a = ap.parse_args()
-    cfg = load_cfg()
-
-    targets = []
-    if a.all:
-        for n in sorted(os.listdir(ROOT)):
-            p = os.path.join(ROOT, n)
-            if os.path.isdir(p) and ws_names(n, cfg):
-                targets.append(p)
-    elif a.workspace:
-        targets.append(os.path.join(ROOT, a.workspace))
-    single = targets or [os.path.join(ROOT, a.workspace or os.environ.get("AWB_WORKSPACE", "example-game"))]
-
-    if a.status:
-        for p in single:
-            status(p)
-        return
-    if a.probe:
-        for p in single:
-            probe(p)
-        return
-    if a.check:
-        rc = 0
-        for p in single:
-            rc += check(p, cfg)
-        sys.exit(1 if rc else 0)
-    if a.why:
-        why(single[0], a.why)
-        return
-    if a.snapshot:
-        for p in single:
-            snapshot(p)
-        return
-    if a.restore:
-        restore(single[0], a.restore, cfg)
-        return
-    if not targets:
-        print("nothing to do; pass --workspace NAME or --all")
-        return
-    for p in targets:
-        build(p, cfg)
-    print("built", len(targets), "shared workspace(s)")
+    parser = argparse.ArgumentParser(description=__doc__)
+    scope = parser.add_mutually_exclusive_group(required=True)
+    scope.add_argument("--workspace")
+    scope.add_argument("--all", action="store_true")
+    actions = parser.add_mutually_exclusive_group()
+    for flag in ("status", "probe", "check", "snapshot"):
+        actions.add_argument("--" + flag, action="store_true")
+    actions.add_argument("--why", choices=(MEMORY, ALIAS))
+    actions.add_argument("--restore")
+    args = parser.parse_args()
+    try:
+        names = C.list_workspaces()
+        if args.workspace:
+            name = os.path.basename(os.path.normpath(args.workspace))
+            ws = os.path.join(C.WORKSPACE_ROOT, name)
+            if name not in names or (os.path.isabs(args.workspace) and not L.same_target(args.workspace, ws)):
+                raise ValueError("Unknown workspace: " + args.workspace)
+            names = [name]
+        elif args.restore:
+            raise ValueError("--restore requires one workspace")
+        else:
+            names = [name for name in names if any(
+                os.path.isdir(os.path.join(C.WORKSPACE_ROOT, name, rel)) for rel in (MEMORY, ALIAS)
+            )]
+        failed = 0
+        for name in names:
+            ws = os.path.join(C.WORKSPACE_ROOT, name)
+            if not L.within(ws, C.WORKSPACE_ROOT):
+                raise ValueError("Workspace escapes configured root: " + ws)
+            if args.why:
+                why(ws, args.why)
+            elif args.restore:
+                restore(ws, args.restore)
+            else:
+                action = next((fn for fn in (status, probe, check, snapshot) if getattr(args, fn.__name__)), build)
+                failed += action(ws) or 0
+        return 1 if failed else 0
+    except (OSError, ValueError, RuntimeError) as error:
+        print("ERROR:", error, file=sys.stderr)
+        return 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
