@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.7.0
+
+- Separate shared memory link records from verified ZIP content backups and recoveries. Include new workspaces in bulk build and check.
+- Validate managed rule markers and preserve encoding and unrelated content through staged replacement and verified backups.
+- Store console logs in the user data directory while retaining the existing configuration precedence.
+
 ## 1.6.0
 
 - Sync archive and unarchive changes for paired Codex and WorkBuddy sessions. Existing states form the baseline, and conflicting history is preserved.

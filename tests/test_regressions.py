@@ -1,12 +1,16 @@
 import datetime
+import io
+import json
 from pathlib import Path
 import tempfile
 import tkinter as tk
 import unittest
 from unittest.mock import patch
+import zipfile
 
 import awb_gui as G
 import awb_links as L
+import awb_memory_backup as B
 import share_workspace as W
 
 
@@ -77,3 +81,57 @@ class MemoryTests(unittest.TestCase):
                 spawn.assert_not_called()
                 app.sync_action("monitor")
                 self.assertEqual(spawn.call_args.args[0][-3:], ["monitor", str(self.root / "w1"), "--compatible-only"])
+
+    def test_memory_backup_preview_recovery_and_merge_preserve_content(self):
+        ws = self.root / "w1"
+        self.build()
+        memory = ws / ".shared" / "memory"
+        note = memory / "MEMORY.md"
+        note.write_text("original", encoding="utf-8")
+        nested = memory / "nested"
+        nested.mkdir()
+        lost = nested / "lost.md"
+        lost.write_text("recover me", encoding="utf-8")
+        archive = B.backup(ws, memory)
+        note.write_text("new content", encoding="utf-8")
+        lost.unlink()
+        self.assertIsNone(B.recover(ws, memory, archive, preview=True))
+        self.assertFalse(list(memory.parent.glob("recovered-memory-*")))
+        recovered = B.recover(ws, memory, archive)
+        self.assertEqual((recovered / "nested" / lost.name).read_text(encoding="utf-8"), "recover me")
+        self.assertEqual(note.read_text(encoding="utf-8"), "new content")
+        for _ in range(2):
+            W.restore_memory(str(ws), archive, preview=False, apply=True)
+        self.assertEqual(lost.read_text(encoding="utf-8"), "recover me")
+        self.assertEqual(note.read_text(encoding="utf-8"), "new content")
+        conflicts = list(memory.glob("MEMORY.md.restored-*"))
+        self.assertEqual(len(conflicts), 1)
+        self.assertEqual(conflicts[0].read_text(encoding="utf-8"), "original")
+        self.assertEqual(W.check(str(ws)), 0)
+
+    def test_memory_restore_rejects_traversal_links_and_bad_hash_before_recovery(self):
+        ws = self.root / "w1"
+        self.build()
+        memory = ws / ".shared" / "memory"
+        for name, mode in (("../outside", 0), ("memory/alias", 0o120000), ("memory/tampered", 0)):
+            with self.subTest(name=name):
+                archive = self.root / "bad.zip"
+                with zipfile.ZipFile(archive, "w") as file:
+                    entry = zipfile.ZipInfo(name)
+                    entry.external_attr = mode << 16
+                    file.writestr(entry, b"data")
+                    file.writestr("manifest.json", json.dumps({
+                        "version": 1, "workspace": L.normalized(ws),
+                        "files": {"tampered": B.digest(io.BytesIO(b"expected"))},
+                    }))
+                with self.assertRaises(ValueError):
+                    B.recover(ws, memory, archive)
+                self.assertFalse(list(memory.parent.glob("recovered-memory-*")))
+
+    def test_all_status_and_check_cover_uninitialized_workspace_and_build_initializes_it(self):
+        ws = self.root / "w1"
+        with patch.object(W.C, "WORKSPACE_ROOT", str(self.root)):
+            for flags, expected in ((["--status"], 0), (["--check"], 1), (["--probe"], 0), ([], 0)):
+                with patch("sys.argv", ["share_workspace.py", "--all", *flags]):
+                    self.assertEqual(W.main(), expected)
+        self.assertEqual(W.check(str(ws)), 0)

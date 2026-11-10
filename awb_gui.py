@@ -24,11 +24,12 @@ from tkinter import ttk, messagebox, filedialog, font as tkfont
 import awb_config as C
 from awb_session_panel import SessionPanel
 
-VERSION = "1.6.0"
+VERSION = "1.7.0"
 APP_TITLE = "AWB 控制台 · 会话与共享记忆"
 OFFSCREEN = "--offscreen" in sys.argv   # 无打扰的窗口测试：把窗口放到屏幕外
 
-LOG_FILE = os.path.join(BASE, "awb_gui.log")
+LOG_DIR = os.path.join(C.DATA_DIR, "logs")
+LOG_FILE = os.path.join(LOG_DIR, "awb_gui.log")
 NATIVE_SYNC = "experiments/native_session_sync/workspace_sync.py"
 CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -342,8 +343,12 @@ class App:
         actions.pack(fill="x")
         for text, action in (("建立记忆链接", self.share_build), ("状态", self.share_status),
                              ("检查", self.share_check), ("落盘验证", self.share_probe),
-                             ("快照", self.share_snapshot), ("按快照重建链接", self.share_restore)):
+                             ("保存链接状态", self.share_snapshot), ("按记录修复链接", self.share_restore)):
             ttk.Button(actions, text=text, command=action).pack(side="left", padx=4)
+        backup_bar = ttk.Frame(self.tab_share, padding=(10, 0, 10, 10))
+        backup_bar.pack(fill="x")
+        ttk.Button(backup_bar, text="备份记忆正文", command=self.share_backup).pack(side="left", padx=4)
+        ttk.Button(backup_bar, text="预览并恢复记忆…", command=self.share_recover).pack(side="left", padx=4)
         ttk.Label(self.tab_share, text="共享位置 .shared/memory，WorkBuddy 通过 .workbuddy/memory 读取。").pack(anchor="w", padx=12)
 
     def _refresh_ws_combos(self):
@@ -369,6 +374,7 @@ class App:
         self.root.destroy()
 
     def _init_logging(self):
+        os.makedirs(LOG_DIR, exist_ok=True)
         logging.basicConfig(
             level=logging.INFO,
             format="%(asctime)s %(levelname)s %(message)s",
@@ -443,7 +449,7 @@ class App:
         if not a:
             messagebox.showinfo(APP_TITLE, "先选一个工作空间。")
             return
-        self.runner.run("生成快照", [PY, script("share_workspace.py"), "--snapshot"] + a)
+        self.runner.run("保存链接状态", [PY, script("share_workspace.py"), "--snapshot"] + a)
 
     def share_restore(self):
         a = self._ws_args()
@@ -452,11 +458,44 @@ class App:
             return
         ws = self.ws_var.get().strip()
         start = os.path.join(C.WORKSPACE_ROOT, ws, ".shared")
-        p = filedialog.askopenfilename(title="选择快照", initialdir=start,
+        p = filedialog.askopenfilename(title="选择链接状态记录", initialdir=start,
                                        filetypes=[("快照 JSON", "snapshot-*.json"), ("JSON", "*.json")])
         if not p:
             return
-        self.runner.run("恢复快照", [PY, script("share_workspace.py"), "--restore", p] + a)
+        self.runner.run("修复记忆链接", [PY, script("share_workspace.py"), "--restore", p] + a)
+
+    def share_backup(self):
+        args = self._ws_args()
+        if not args:
+            messagebox.showinfo(APP_TITLE, "先选一个工作空间。")
+            return
+        self.runner.run("备份并校验记忆正文", [PY, script("share_workspace.py"), "--backup-memory"] + args)
+
+    def share_recover(self):
+        if self.runner.busy:
+            return
+        args = self._ws_args()
+        if not args:
+            messagebox.showinfo(APP_TITLE, "先选一个工作空间。")
+            return
+        initial = os.path.join(C.WORKSPACE_ROOT, self.ws_var.get(), ".shared", "memory-backups")
+        path = filedialog.askopenfilename(title="选择记忆备份", initialdir=initial,
+                                          filetypes=[("记忆备份 ZIP", "*.zip")], parent=self.root)
+        if not path:
+            return
+        command = [PY, script("share_workspace.py"), "--restore-memory", path] + args
+
+        def choose():
+            mode = messagebox.askyesnocancel(
+                "恢复记忆",
+                "差异已列在日志中。\n\n是：合并到共享记忆，冲突保留两份。\n"
+                "否：恢复到独立目录。\n取消：退出恢复。",
+                default="no", parent=self.root,
+            )
+            if mode is not None:
+                self.runner.run("校验并恢复记忆", command + (["--apply-memory"] if mode else []))
+
+        self.runner.run("核对备份及当前记忆差异", command + ["--restore-preview"], after=choose)
 
     def _build_rules_tab(self):
         bar = ttk.Frame(self.tab_rules, padding=(10, 10))
@@ -466,7 +505,7 @@ class App:
             ("Lint", "-Lint", "检查块长度、密钥、重复行；有问题直接报出来。"),
             ("预演更新", "-DryRun -Update", "预览将要写入的 16 个规则文件，不落盘。"),
             ("更新（分发）", "-Update", "把 snippet 里的块分发到 16 个客户端规则文件，改动前自动 .bak 备份。"),
-            ("检查", "-Check", "只读一致性检查，drift 时退出码 1。"),
+            ("检查", "-Check", "只读检查。规则有差异时退出码 1，解析或读取失败时退出码 2。"),
         ]
         for text, flag, tip in acts:
             b = ttk.Button(bar, text=text, width=13,
@@ -559,10 +598,11 @@ def run_selftest():
     chk("控制台 Python 解释器存在", os.path.isfile(PY), PY)
     chk("工作空间根存在", os.path.isdir(C.WORKSPACE_ROOT), C.WORKSPACE_ROOT)
     chk("规则块源存在", os.path.isfile(C.SNIPPET), C.SNIPPET)
-    for f in ("share_workspace.py", "sync-agent-memory.ps1", "awb_sessions.py", "awb_session_panel.py", NATIVE_SYNC,
+    for f in ("share_workspace.py", "awb_memory_backup.py", "sync-agent-memory.ps1", "awb_sessions.py", "awb_session_panel.py", NATIVE_SYNC,
               "experiments/native_session_sync/session_lifecycle.py", "experiments/native_session_sync/probe_codex.py"):
         chk("脚本存在 " + f, os.path.isfile(script(f)))
     try:
+        os.makedirs(LOG_DIR, exist_ok=True)
         with open(LOG_FILE, "a", encoding="utf-8") as h:
             h.write("")
         chk("日志文件可写", True, LOG_FILE)
@@ -618,7 +658,8 @@ def run_once():
 def _crash_log(text):
     """noconsole 打包后没有 stdout，异常落盘便于排查。"""
     try:
-        with open(os.path.join(BASE, "awb_gui_error.log"), "a", encoding="utf-8") as f:
+        os.makedirs(LOG_DIR, exist_ok=True)
+        with open(os.path.join(LOG_DIR, "awb_gui_error.log"), "a", encoding="utf-8") as f:
             f.write("[%s]\n%s\n" % (datetime.datetime.now().isoformat(), text))
     except Exception:
         pass

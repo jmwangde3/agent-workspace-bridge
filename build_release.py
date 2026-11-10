@@ -10,7 +10,7 @@ import sys
 ROOT = Path(__file__).resolve().parent
 RUNTIME = (
     'awb_config.py', 'awb_gui.py', 'awb_gui.pyw', 'awb_links.py', 'awb_sessions.py',
-    'awb_session_panel.py', 'share_workspace.py', 'sync-agent-memory.ps1', 'run_gui.bat',
+    'awb_session_panel.py', 'share_workspace.py', 'awb_memory_backup.py', 'sync-agent-memory.ps1', 'run_gui.bat',
     'config.example.json', 'README.md', 'CHANGELOG.md', 'configs/agent-memory-snippet.md',
     'experiments/native_session_sync/README.md', 'experiments/native_session_sync/workspace_sync.py',
     'experiments/native_session_sync/native_sync.py', 'experiments/native_session_sync/offline_sync.py',
