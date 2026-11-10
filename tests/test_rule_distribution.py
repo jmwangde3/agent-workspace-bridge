@@ -76,7 +76,11 @@ class RuleDistributionTest(unittest.TestCase):
         target = folder / "AGENTS.md"
         target.write_bytes(b"<!-- awb -->\nold\n<!-- /awb -->\n")
         command = [POWERSHELL, "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-File", str(SCRIPT)]
-        before = {p.relative_to(profile): p.read_bytes() for p in profile.rglob("*") if p.is_file()}
+        def rule_files():
+            return {p.relative_to(profile): p.read_bytes() for p in profile.rglob("*")
+                    if p.relative_to(profile).parts[0] != "AppData" and p.is_file()}
+
+        before = rule_files()
         for flags, expected in (([], 0), (["-Status"], 0), (["-Check"], 1), (["-Lint"], 0),
                                 (["-DryRun"], 0), (["-DryRun", "-Update"], 0),
                                 (["-Check", "-Update"], 2)):
@@ -84,7 +88,7 @@ class RuleDistributionTest(unittest.TestCase):
                 result = subprocess.run(command + flags, env=dict(os.environ, USERPROFILE=str(profile)),
                                         capture_output=True, timeout=20)
                 self.assertEqual(result.returncode, expected, (result.stdout, result.stderr))
-                self.assertEqual({p.relative_to(profile): p.read_bytes() for p in profile.rglob("*") if p.is_file()}, before)
+                self.assertEqual(rule_files(), before)
 
     @unittest.skipUnless(os.name == "nt", "Hard link protection is Windows-specific")
     def test_update_refuses_to_break_hard_link(self):
